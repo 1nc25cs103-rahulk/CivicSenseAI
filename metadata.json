@@ -1,0 +1,6 @@
+{
+  "name": "CivicSense AI",
+  "description": "Smarter Cities. Faster Responses. Better Infrastructure. AI-powered public infrastructure monitoring, complaint analysis, and intelligent prioritization platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
