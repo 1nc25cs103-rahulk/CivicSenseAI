@@ -1,16 +1,23 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   ArrowUpDown,
   BarChart3,
   BrainCircuit,
+  Building2,
+  Clock,
   Download,
+  FileSearch,
+  KeyRound,
   LayoutDashboard,
   ListFilter,
   LogOut,
-  MapPin,
   Menu,
+  Scale,
   Search,
+  Settings,
   ShieldAlert,
+  ShieldCheck,
   X,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -26,6 +33,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import { evaluateComplaintSla } from '../../../shared/sla.ts';
 import { downloadComplaintsCsv, fetchAnalytics, fetchComplaints } from '../../lib/api.ts';
 import {
   formatLocaleDate,
@@ -50,8 +58,15 @@ import { PWAInstallButton } from '../common/PWAInstallButton.tsx';
 import { PriorityIndicator, StatusIndicator } from '../common/SemanticIndicators.tsx';
 import { KarnatakaMap } from '../maps/KarnatakaMap.tsx';
 import { AdminAnalyticsView } from './AdminAnalyticsView.tsx';
+import { AdminAuditLogsView, AdminSettingsView } from './AdminAuditAndSettingsViews.tsx';
 import { AdminComplaintInspector } from './AdminComplaintInspector.tsx';
 import { AdminInsightsView } from './AdminInsightsView.tsx';
+import { AdminProvisioningView } from './AdminProvisioningView.tsx';
+import {
+  AdminDepartmentManagementView,
+  AdminLegalEscalationsView,
+  AdminSlaBreachesView,
+} from './AdminSlaAndEscalationViews.tsx';
 
 interface AdminDashboardProps {
   user: User;
@@ -89,6 +104,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [filterPriority, setFilterPriority] = useState('All');
   const [filterDistrict, setFilterDistrict] = useState('All');
   const [filterStatus, setFilterStatus] = useState('All');
+  const [filterSlaStatus, setFilterSlaStatus] = useState<'all' | 'breached' | 'escalated'>('all');
   const [sortBy, setSortBy] = useState<'priority' | 'date' | 'severity'>('priority');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [managedComplaints, setManagedComplaints] = useState<Complaint[]>(complaints);
@@ -118,6 +134,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       priority: filterPriority,
       district: filterDistrict,
       status: filterStatus,
+      slaStatus: filterSlaStatus,
       sortBy,
       sortDir,
     })
@@ -133,6 +150,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           if (filterPriority !== 'All' && c.priority_level !== filterPriority) return false;
           if (filterDistrict !== 'All' && c.district !== filterDistrict) return false;
           if (filterStatus !== 'All' && c.status !== filterStatus) return false;
+          if (filterSlaStatus === 'breached' && !evaluateComplaintSla(c).isBreached) return false;
+          if (
+            filterSlaStatus === 'escalated' &&
+            !c.escalation_notice_generated &&
+            !c.escalation_notice_sent_at
+          ) {
+            return false;
+          }
           if (
             q &&
             !c.complaint_code.toLowerCase().includes(q) &&
@@ -161,6 +186,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     filterPriority,
     filterDistrict,
     filterStatus,
+    filterSlaStatus,
     sortBy,
     sortDir,
     refreshTick,
@@ -231,17 +257,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     return Array.from(map.values()).sort((a, b) => b.count - a.count || b.maxPriority - a.maxPriority);
   }, [hotspotComplaints]);
 
+  const slaMetrics = useMemo(() => {
+    let breached = 0;
+    let escalated = 0;
+    complaints.forEach((c) => {
+      if (evaluateComplaintSla(c).isBreached) breached += 1;
+      if (c.escalation_notice_generated || c.escalation_notice_sent_at) escalated += 1;
+    });
+    return { breached, escalated };
+  }, [complaints]);
+
   const handleUpdated = async () => {
     await onRefreshAll();
     setRefreshTick((tick) => tick + 1);
   };
 
-  const navItems: Array<{ id: AdminTab; label: string; icon: React.ReactNode }> = [
-    { id: 'overview', label: t('admin.nav.overview'), icon: <LayoutDashboard className="h-4 w-4" /> },
-    { id: 'management', label: t('admin.nav.management'), icon: <ListFilter className="h-4 w-4" /> },
-    { id: 'hotspots', label: t('admin.nav.hotspots'), icon: <MapPin className="h-4 w-4" /> },
-    { id: 'analytics', label: t('admin.nav.analytics'), icon: <BarChart3 className="h-4 w-4" /> },
-    { id: 'insights', label: t('admin.nav.insights'), icon: <BrainCircuit className="h-4 w-4" /> },
+  const navItems: Array<{ id: AdminTab; label: string; icon: React.ReactNode; badge?: number }> = [
+    { id: 'overview', label: t('adminConsole.nav.overview', { defaultValue: 'Overview Dashboard' }), icon: <LayoutDashboard className="h-4 w-4" /> },
+    { id: 'management', label: t('adminConsole.nav.management', { defaultValue: 'Complaint Management' }), icon: <ListFilter className="h-4 w-4" /> },
+    { id: 'ai_monitoring', label: t('adminConsole.nav.aiMonitoring', { defaultValue: 'AI Priority & Hotspots' }), icon: <BrainCircuit className="h-4 w-4" /> },
+    { id: 'departments', label: t('adminConsole.nav.departments', { defaultValue: 'Department Management' }), icon: <Building2 className="h-4 w-4" /> },
+    { id: 'provisioning', label: t('adminConsole.nav.provisioning', { defaultValue: 'Official Provisioning' }), icon: <KeyRound className="h-4 w-4" /> },
+    { id: 'sla_breaches', label: t('adminConsole.nav.slaBreaches', { defaultValue: 'SLA Breach Monitoring' }), icon: <Clock className="h-4 w-4" />, badge: slaMetrics.breached },
+    { id: 'escalations', label: t('adminConsole.nav.escalations', { defaultValue: 'Legal Escalations' }), icon: <Scale className="h-4 w-4" />, badge: slaMetrics.escalated },
+    { id: 'analytics', label: t('adminConsole.nav.analytics', { defaultValue: 'Analytics & Reports' }), icon: <BarChart3 className="h-4 w-4" /> },
+    { id: 'audit_logs', label: t('adminConsole.nav.auditLogs', { defaultValue: 'Audit Logs' }), icon: <FileSearch className="h-4 w-4" /> },
+    { id: 'settings', label: t('adminConsole.nav.settings', { defaultValue: 'System Settings' }), icon: <Settings className="h-4 w-4" /> },
   ];
 
   const activeNavLabel = navItems.find((i) => i.id === activeTab)?.label ?? t('admin.nav.overview');
@@ -258,23 +299,35 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           >
             {t('common.appName')}
           </button>
-          <div className="mt-0.5 text-[11px] text-slate-400">{t('admin.consoleTitle')}</div>
+          <div className="mt-1 flex items-center gap-1.5 text-[11px] text-emerald-400 font-medium">
+            <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate">
+              {user.role === 'super_admin' ? 'Super Admin Command' : user.department || t('admin.consoleTitle')}
+            </span>
+          </div>
         </div>
 
-        <nav className="flex-1 space-y-1 p-3">
+        <nav className="flex-1 space-y-1 p-3 overflow-y-auto">
           {navItems.map((item) => (
             <button
               key={item.id}
               type="button"
               onClick={() => setActiveTab(item.id)}
-              className={`flex w-full items-center gap-3 rounded-lg px-3.5 py-2.5 text-sm font-medium transition-colors cursor-pointer ${
+              className={`flex w-full items-center justify-between gap-2 rounded-lg px-3.5 py-2.5 text-sm font-medium transition-colors cursor-pointer ${
                 activeTab === item.id
                   ? 'bg-slate-800 text-white'
                   : 'text-slate-300 hover:bg-slate-800/60 hover:text-white'
               }`}
             >
-              {item.icon}
-              <span className="truncate">{item.label}</span>
+              <span className="flex items-center gap-3 min-w-0">
+                {item.icon}
+                <span className="truncate">{item.label}</span>
+              </span>
+              {typeof item.badge === 'number' && item.badge > 0 && (
+                <span className="rounded bg-rose-600/90 px-1.5 py-0.5 font-mono text-[10px] font-bold tabular-nums text-white">
+                  {item.badge}
+                </span>
+              )}
             </button>
           ))}
         </nav>
@@ -283,6 +336,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <div className="text-xs">
             <div className="font-semibold text-white truncate">{user.full_name}</div>
             <div className="text-slate-400 truncate">{user.email}</div>
+            <div className="mt-0.5 text-[11px] text-emerald-400 truncate">
+              {user.role === 'super_admin' ? 'Super Administrator' : 'Municipal Official'}
+            </div>
           </div>
           <button
             type="button"
@@ -368,6 +424,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <div className="flex items-center gap-2.5 shrink-0">
               <LanguageSelector
                 variant="light"
+                isAuthenticated
                 onLanguageUpdated={(_lang, updatedUser) => {
                   if (updatedUser) onUserUpdated?.(updatedUser);
                 }}
@@ -442,6 +499,41 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   </div>
                 </div>
               </div>
+
+              {/* SLA & Escalation Alert Strip */}
+              {(slaMetrics.breached > 0 || slaMetrics.escalated > 0) && (
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50/70 px-5 py-3.5 text-xs text-rose-950">
+                  <div className="flex flex-wrap items-center gap-4">
+                    <span className="inline-flex items-center gap-1.5 font-semibold text-rose-900">
+                      <AlertTriangle className="h-4 w-4 text-rose-700" />
+                      <span>Governance SLA Alert:</span>
+                    </span>
+                    <span className="font-mono font-bold tabular-nums">
+                      {slaMetrics.breached} SLA Breached
+                    </span>
+                    <span aria-hidden="true">·</span>
+                    <span className="font-mono font-bold tabular-nums">
+                      {slaMetrics.escalated} Legal / SLA Escalations Issued
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('sla_breaches')}
+                      className="rounded-lg border border-rose-300 bg-white px-3 py-1.5 font-semibold text-rose-900 hover:bg-rose-100 cursor-pointer"
+                    >
+                      Open SLA Monitor
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('escalations')}
+                      className="rounded-lg bg-rose-700 px-3 py-1.5 font-semibold text-white hover:bg-rose-800 cursor-pointer"
+                    >
+                      View Legal Escalations
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Charts Row */}
               {overviewAnalytics && (
@@ -712,22 +804,38 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </div>
 
                 <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-xs font-medium text-slate-500">
-                      {t('admin.management.statusLabel')}
-                    </span>
-                    <select
-                      value={filterStatus}
-                      onChange={(e) => setFilterStatus(e.target.value)}
-                      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-900 focus:border-blue-600 focus:outline-none"
-                    >
-                      <option value="All">{t('admin.management.allStatuses')}</option>
-                      {COMPLAINT_STATUSES.map((s) => (
-                        <option key={s} value={s}>
-                          {translateStatus(t, s)}
-                        </option>
-                      ))}
-                    </select>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium text-slate-500">
+                        {t('admin.management.statusLabel')}
+                      </span>
+                      <select
+                        value={filterStatus}
+                        onChange={(e) => setFilterStatus(e.target.value)}
+                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-900 focus:border-blue-600 focus:outline-none"
+                      >
+                        <option value="All">{t('admin.management.allStatuses')}</option>
+                        {COMPLAINT_STATUSES.map((s) => (
+                          <option key={s} value={s}>
+                            {translateStatus(t, s)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium text-slate-500">SLA / Legal:</span>
+                      <select
+                        value={filterSlaStatus}
+                        onChange={(e) =>
+                          setFilterSlaStatus(e.target.value as 'all' | 'breached' | 'escalated')
+                        }
+                        className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-900 focus:border-blue-600 focus:outline-none"
+                      >
+                        <option value="all">All SLA States</option>
+                        <option value="breached">SLA Breached Only</option>
+                        <option value="escalated">Legal / SLA Escalation Issued</option>
+                      </select>
+                    </div>
                   </div>
 
                   <div className="flex items-center gap-2 text-xs">
@@ -803,6 +911,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                 )}
                                 <span className="truncate">{c.title}</span>
                               </div>
+                              {(c.escalation_notice_generated || c.escalation_notice_sent_at) && (
+                                <div className="mt-1 inline-flex items-center rounded border border-rose-300 bg-rose-50 px-1.5 py-0.5 text-[10px] font-semibold text-rose-800">
+                                  ⚠️ Legal / SLA Escalation Issued
+                                </div>
+                              )}
                               {(c.duplicate_count ?? 0) > 0 && (
                                 <div className="text-[11px] text-orange-700 font-medium">
                                   {t('admin.management.relatedReports', { count: c.duplicate_count })}
@@ -837,140 +950,176 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
           )}
 
-          {/* 3. GEOGRAPHICAL HOTSPOT ANALYSIS */}
-          {activeTab === 'hotspots' && (
-            <div className="space-y-6">
-              <div className="flex flex-wrap items-end justify-between gap-4">
-                <div>
-                  <div className="text-xs font-medium text-slate-500">
-                    {t('admin.hotspots.kicker')}
-                  </div>
-                  <h1 className="mt-1 font-display text-2xl font-bold text-slate-900">
-                    {t('admin.hotspots.title')}
-                  </h1>
-                </div>
+          {/* 3. AI PRIORITY MONITORING & GEOSPATIAL HOTSPOTS */}
+          {activeTab === 'ai_monitoring' && (
+            <div className="space-y-8">
+              <AdminInsightsView
+                refreshTrigger={refreshTick}
+                onInspectComplaintId={(id) => setInspectingId(id)}
+              />
 
-                <div className="flex flex-wrap items-center gap-3">
-                  <select
-                    value={hotspotCategory}
-                    onChange={(e) => setHotspotCategory(e.target.value)}
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-900"
-                  >
-                    <option value="All">{t('admin.hotspots.allCategories')}</option>
-                    {INFRASTRUCTURE_CATEGORIES.map((cat) => (
-                      <option key={cat} value={cat}>
-                        {translateCategory(t, cat)}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    value={hotspotPriority}
-                    onChange={(e) => setHotspotPriority(e.target.value)}
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-900"
-                  >
-                    <option value="All">{t('admin.hotspots.allPriorities')}</option>
-                    <option value="Critical">{t('admin.hotspots.criticalOnly')}</option>
-                    <option value="High">{t('admin.hotspots.highPriority')}</option>
-                    <option value="Medium">{translatePriority(t, 'Medium')}</option>
-                    <option value="Low">{translatePriority(t, 'Low')}</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="grid gap-6 lg:grid-cols-12 items-start">
-                <div className="lg:col-span-8 space-y-3">
-                  <KarnatakaMap
-                    mode="hotspot"
-                    complaints={hotspotComplaints}
-                    hotspots={hotspotClusters}
-                    onSelectComplaint={(c) => setInspectingId(c.id)}
-                    heightClass="h-[520px]"
-                  />
-
-                  <div className="flex flex-wrap items-center gap-5 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-600">
-                    <span className="font-semibold text-slate-800">
-                      {t('admin.hotspots.legendLabel')}
-                    </span>
-                    <span className="inline-flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-full bg-red-600" />{' '}
-                      {t('admin.hotspots.legendCritical')}
-                    </span>
-                    <span className="inline-flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-full bg-orange-600" />{' '}
-                      {t('admin.hotspots.legendHigh')}
-                    </span>
-                    <span className="inline-flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-full bg-amber-600" />{' '}
-                      {t('admin.hotspots.legendMedium')}
-                    </span>
-                    <span className="inline-flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-full bg-emerald-600" />{' '}
-                      {t('admin.hotspots.legendResolved')}
-                    </span>
-                  </div>
-                </div>
-
-                {/* Hotspot Cluster Sidebar */}
-                <div className="lg:col-span-4 rounded-xl border border-slate-200 bg-white p-5 space-y-4">
+              <div className="border-t border-slate-200 pt-8 space-y-6">
+                <div className="flex flex-wrap items-end justify-between gap-4">
                   <div>
-                    <h2 className="font-display text-base font-semibold text-slate-900">
-                      {t('admin.hotspots.clustersTitle')}
+                    <div className="text-xs font-medium text-slate-500">
+                      {t('admin.hotspots.kicker')}
+                    </div>
+                    <h2 className="mt-1 font-display text-xl font-bold text-slate-900">
+                      {t('admin.hotspots.title')}
                     </h2>
-                    <p className="text-xs text-slate-500">
-                      {t('admin.hotspots.clustersSub')}
-                    </p>
                   </div>
 
-                  <div className="space-y-3 max-h-[460px] overflow-y-auto pr-1">
-                    {hotspotClusters.length === 0 ? (
-                      <p className="text-xs text-slate-500">{t('admin.hotspots.emptyClusters')}</p>
-                    ) : (
-                      hotspotClusters.map((spot) => (
-                        <div
-                          key={`${spot.district}-${spot.locality}`}
-                          className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 space-y-1.5"
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-sm font-semibold text-slate-900">
-                              {spot.locality}, {translateDistrict(t, spot.district)}
-                            </span>
-                            <span className="font-mono tabular-nums text-xs font-bold text-slate-800">
-                              {t('admin.hotspots.activeCount', { count: spot.count })}
-                            </span>
-                          </div>
-                          <div className="text-xs text-slate-600">
-                            {t('admin.hotspots.primaryIssue', {
-                              category: translateCategory(t, spot.topCategory),
-                            })}
-                          </div>
-                          <div className="flex items-center justify-between text-[11px] text-slate-500">
-                            <span>
-                              {t('admin.hotspots.peakPriority', { score: spot.maxPriority })}
-                            </span>
-                            {spot.criticalCount > 0 && (
-                              <span className="font-semibold text-red-700">
-                                {t('admin.hotspots.criticalBadge', { count: spot.criticalCount })}
+                  <div className="flex flex-wrap items-center gap-3">
+                    <select
+                      value={hotspotCategory}
+                      onChange={(e) => setHotspotCategory(e.target.value)}
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-900"
+                    >
+                      <option value="All">{t('admin.hotspots.allCategories')}</option>
+                      {INFRASTRUCTURE_CATEGORIES.map((cat) => (
+                        <option key={cat} value={cat}>
+                          {translateCategory(t, cat)}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={hotspotPriority}
+                      onChange={(e) => setHotspotPriority(e.target.value)}
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-900"
+                    >
+                      <option value="All">{t('admin.hotspots.allPriorities')}</option>
+                      <option value="Critical">{t('admin.hotspots.criticalOnly')}</option>
+                      <option value="High">{t('admin.hotspots.highPriority')}</option>
+                      <option value="Medium">{translatePriority(t, 'Medium')}</option>
+                      <option value="Low">{translatePriority(t, 'Low')}</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="grid gap-6 lg:grid-cols-12 items-start">
+                  <div className="lg:col-span-8 space-y-3">
+                    <KarnatakaMap
+                      mode="hotspot"
+                      complaints={hotspotComplaints}
+                      hotspots={hotspotClusters}
+                      onSelectComplaint={(c) => setInspectingId(c.id)}
+                      heightClass="h-[520px]"
+                    />
+
+                    <div className="flex flex-wrap items-center gap-5 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-600">
+                      <span className="font-semibold text-slate-800">
+                        {t('admin.hotspots.legendLabel')}
+                      </span>
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="h-2.5 w-2.5 rounded-full bg-red-600" />{' '}
+                        {t('admin.hotspots.legendCritical')}
+                      </span>
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="h-2.5 w-2.5 rounded-full bg-orange-600" />{' '}
+                        {t('admin.hotspots.legendHigh')}
+                      </span>
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="h-2.5 w-2.5 rounded-full bg-amber-600" />{' '}
+                        {t('admin.hotspots.legendMedium')}
+                      </span>
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="h-2.5 w-2.5 rounded-full bg-emerald-600" />{' '}
+                        {t('admin.hotspots.legendResolved')}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Hotspot Cluster Sidebar */}
+                  <div className="lg:col-span-4 rounded-xl border border-slate-200 bg-white p-5 space-y-4">
+                    <div>
+                      <h3 className="font-display text-base font-semibold text-slate-900">
+                        {t('admin.hotspots.clustersTitle')}
+                      </h3>
+                      <p className="text-xs text-slate-500">
+                        {t('admin.hotspots.clustersSub')}
+                      </p>
+                    </div>
+
+                    <div className="space-y-3 max-h-[460px] overflow-y-auto pr-1">
+                      {hotspotClusters.length === 0 ? (
+                        <p className="text-xs text-slate-500">{t('admin.hotspots.emptyClusters')}</p>
+                      ) : (
+                        hotspotClusters.map((spot) => (
+                          <div
+                            key={`${spot.district}-${spot.locality}`}
+                            className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 space-y-1.5"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-sm font-semibold text-slate-900">
+                                {spot.locality}, {translateDistrict(t, spot.district)}
                               </span>
-                            )}
+                              <span className="font-mono tabular-nums text-xs font-bold text-slate-800">
+                                {t('admin.hotspots.activeCount', { count: spot.count })}
+                              </span>
+                            </div>
+                            <div className="text-xs text-slate-600">
+                              {t('admin.hotspots.primaryIssue', {
+                                category: translateCategory(t, spot.topCategory),
+                              })}
+                            </div>
+                            <div className="flex items-center justify-between text-[11px] text-slate-500">
+                              <span>
+                                {t('admin.hotspots.peakPriority', { score: spot.maxPriority })}
+                              </span>
+                              {spot.criticalCount > 0 && (
+                                <span className="font-semibold text-red-700">
+                                  {t('admin.hotspots.criticalBadge', { count: spot.criticalCount })}
+                                </span>
+                              )}
+                            </div>
                           </div>
-                        </div>
-                      ))
-                    )}
+                        ))
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
           )}
 
-          {/* 4. ANALYTICS & REPORTS */}
-          {activeTab === 'analytics' && <AdminAnalyticsView refreshTrigger={refreshTick} />}
-
-          {/* 5. AI INTELLIGENCE MODULE */}
-          {activeTab === 'insights' && (
-            <AdminInsightsView
-              refreshTrigger={refreshTick}
+          {/* 4. DEPARTMENT MANAGEMENT */}
+          {activeTab === 'departments' && (
+            <AdminDepartmentManagementView
+              complaints={complaints}
               onInspectComplaintId={(id) => setInspectingId(id)}
             />
+          )}
+
+          {/* 5. OFFICIAL PROVISIONING & INVITES */}
+          {activeTab === 'provisioning' && (
+            <AdminProvisioningView currentUser={user} refreshTrigger={refreshTick} />
+          )}
+
+          {/* 6. SLA BREACH MONITORING */}
+          {activeTab === 'sla_breaches' && (
+            <AdminSlaBreachesView
+              complaints={complaints}
+              onInspectComplaintId={(id) => setInspectingId(id)}
+            />
+          )}
+
+          {/* 7. LEGAL ESCALATION TRACKING */}
+          {activeTab === 'escalations' && (
+            <AdminLegalEscalationsView
+              complaints={complaints}
+              onInspectComplaintId={(id) => setInspectingId(id)}
+            />
+          )}
+
+          {/* 8. ANALYTICS & REPORTS */}
+          {activeTab === 'analytics' && <AdminAnalyticsView refreshTrigger={refreshTick} />}
+
+          {/* 9. AUDIT LOGS */}
+          {activeTab === 'audit_logs' && <AdminAuditLogsView refreshTrigger={refreshTick} />}
+
+          {/* 10. SYSTEM SETTINGS */}
+          {activeTab === 'settings' && (
+            <AdminSettingsView currentUser={user} refreshTrigger={refreshTick} />
           )}
         </main>
       </div>

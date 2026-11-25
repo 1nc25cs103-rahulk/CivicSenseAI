@@ -6,9 +6,28 @@ import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
   const isStandaloneVite = process.env.STANDALONE_VITE === 'true';
+  const disableHmr = process.env.DISABLE_HMR === 'true';
 
   return {
     plugins: [
+      ...(disableHmr
+        ? [
+            {
+              name: 'disable-vite-hmr-websocket',
+              apply: 'serve' as const,
+              transform(code: string, id: string) {
+                const cleanId = id.split('?')[0].replace(/\\/g, '/');
+                if (cleanId.endsWith('/vite/dist/client/client.mjs')) {
+                  return code.replace(
+                    /const transport = normalizeModuleRunnerTransport\([\s\S]*?\}\)\(\)\);/,
+                    'const transport = normalizeModuleRunnerTransport({ connect() {}, disconnect() {}, send() {} });'
+                  );
+                }
+                return null;
+              },
+            },
+          ]
+        : []),
       react(),
       tailwindcss(),
       VitePWA({
@@ -107,8 +126,9 @@ export default defineConfig(() => {
       },
     },
     server: {
-      hmr: process.env.DISABLE_HMR !== 'true',
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      hmr: !disableHmr,
+      ws: disableHmr ? (false as const) : undefined,
+      watch: disableHmr ? null : {},
       proxy: isStandaloneVite
         ? {
             '/api': 'http://localhost:3001',

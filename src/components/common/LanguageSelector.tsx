@@ -11,6 +11,7 @@ import type { SupportedLanguage, User } from '../../types/index.ts';
 
 interface LanguageSelectorProps {
   variant?: 'light' | 'navy';
+  isAuthenticated?: boolean;
   onLanguageUpdated?: (lang: SupportedLanguage, updatedUser?: User) => void;
 }
 
@@ -22,6 +23,7 @@ const LANGUAGE_OPTIONS: Array<{ code: SupportedLanguage; nativeLabel: string }> 
 
 export const LanguageSelector: React.FC<LanguageSelectorProps> = ({
   variant = 'light',
+  isAuthenticated = false,
   onLanguageUpdated,
 }) => {
   const { i18n, t } = useTranslation();
@@ -36,7 +38,7 @@ export const LanguageSelector: React.FC<LanguageSelectorProps> = ({
     saveLocalLanguage(next);
     await i18n.changeLanguage(next);
 
-    if (getStoredToken()) {
+    if (isAuthenticated || getStoredToken()) {
       try {
         const updatedUser = await updateUserPreferencesApi(next);
         onLanguageUpdated?.(next, updatedUser);

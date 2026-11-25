@@ -21,12 +21,14 @@ async function bootstrap() {
   const httpServer = http.createServer(app);
 
   if (!isProd) {
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        hmr: { server: httpServer },
-        watch: process.env.DISABLE_HMR === 'true' ? null : undefined,
+        hmr: disableHmr ? false : true,
+        ws: disableHmr ? false : { server: httpServer },
+        watch: disableHmr ? null : undefined,
       },
       appType: 'spa',
     });

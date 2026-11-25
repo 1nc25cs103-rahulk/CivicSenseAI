@@ -1,3 +1,4 @@
+import { calculateSlaDeadline } from '../../shared/sla.ts';
 import type { ComplaintStatus, InfrastructureCategory } from '../../shared/types.ts';
 import {
   calculateHaversineKm,
@@ -628,7 +629,7 @@ function ensureSeededAuthAccounts(): void {
   const nowIso = new Date().toISOString();
 
   // 1. Seed or sync Demo Citizen account (owns seeded demo complaints)
-  const existingCitizen = db.prepare("SELECT id, email, password_hash FROM Users WHERE role = 'CITIZEN' ORDER BY id ASC LIMIT 1").get() as
+  const existingCitizen = db.prepare("SELECT id, email, password_hash FROM Users WHERE role = 'citizen' ORDER BY id ASC LIMIT 1").get() as
     | { id: number; email: string; password_hash: string }
     | undefined;
 
@@ -648,7 +649,7 @@ function ensureSeededAuthAccounts(): void {
       `INSERT INTO Users (
         full_name, email, mobile, password_hash, role,
         security_question, security_answer_hash, account_status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'CITIZEN', ?, ?, 'active', ?, ?)`
+      ) VALUES (?, ?, ?, ?, 'citizen', ?, ?, 'active', ?, ?)`
     ).run(
       'Aarav Kulkarni',
       citizenEmail,
@@ -701,16 +702,16 @@ function ensureSeededAuthAccounts(): void {
     return;
   }
 
-  const existingAdmin = db.prepare("SELECT id FROM Users WHERE role = 'ADMIN' ORDER BY id ASC LIMIT 1").get() as
+  const existingAdmin = db.prepare("SELECT id FROM Users WHERE role IN ('admin', 'super_admin') ORDER BY id ASC LIMIT 1").get() as
     | { id: number }
     | undefined;
 
   if (!existingAdmin) {
     db.prepare(
       `INSERT INTO Users (
-        full_name, email, mobile, password_hash, role,
+        full_name, email, mobile, password_hash, role, department, employee_id, designation,
         security_question, security_answer_hash, account_status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'ADMIN', ?, ?, 'active', ?, ?)`
+      ) VALUES (?, ?, ?, ?, 'super_admin', 'Central Command', 'GOV-KA-0001', 'Chief Civic Commissioner', ?, ?, 'active', ?, ?)`
     ).run(
       'Meera Deshpande',
       adminEmail,
@@ -754,7 +755,7 @@ export function seedDatabaseIfEmpty(): { seeded: boolean; count: number } {
     return { seeded: false, count: existingComplaints.count };
   }
 
-  const citizenRow = db.prepare("SELECT id FROM Users WHERE role = 'CITIZEN' ORDER BY id ASC LIMIT 1").get() as { id: number };
+  const citizenRow = db.prepare("SELECT id FROM Users WHERE role = 'citizen' ORDER BY id ASC LIMIT 1").get() as { id: number };
   const citizenId = citizenRow?.id ?? 1;
 
   const insertComplaint = db.prepare(`
@@ -764,14 +765,14 @@ export function seedDatabaseIfEmpty(): { seeded: boolean; count: number } {
       incident_date, contact_info, affected_citizens, severity, priority_score,
       priority_level, ai_keywords, ai_explanation, suggested_action,
       factor_breakdown, critical_safety_flag, ai_source, status, is_demo,
-      created_at, updated_at
+      sla_deadline, created_at, updated_at
     ) VALUES (
       @complaint_code, @user_id, @title, @description, @category, @predicted_category,
       @image_path, @location, @locality, @district, @latitude, @longitude,
       @incident_date, @contact_info, @affected_citizens, @severity, @priority_score,
       @priority_level, @ai_keywords, @ai_explanation, @suggested_action,
       @factor_breakdown, @critical_safety_flag, @ai_source, @status, 1,
-      @created_at, @updated_at
+      @sla_deadline, @created_at, @updated_at
     )
   `);
 
@@ -874,6 +875,7 @@ export function seedDatabaseIfEmpty(): { seeded: boolean; count: number } {
         critical_safety_flag: analysis.criticalSafetyFlag ? 1 : 0,
         ai_source: 'rules',
         status: spec.status,
+        sla_deadline: calculateSlaDeadline(createdAt, analysis.priorityScore),
         created_at: createdAt,
         updated_at: updatedAt,
       });

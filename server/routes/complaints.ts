@@ -2,12 +2,14 @@ import { Router } from 'express';
 import fs from 'fs';
 import multer from 'multer';
 import path from 'path';
+import { calculateSlaDeadline, evaluateComplaintSla } from '../../shared/sla.ts';
 import type {
   AnalyticsResponse,
   Complaint,
   ComplaintDetail,
   ComplaintStatus,
   DuplicateMatch,
+  EscalationLetterResponse,
   InfrastructureCategory,
   PriorityFactorBreakdown,
   SupportedLanguage,
@@ -15,6 +17,7 @@ import type {
 import {
   COMPLAINT_STATUSES,
   INFRASTRUCTURE_CATEGORIES,
+  isAdminRole,
   KARNATAKA_DISTRICTS,
 } from '../../shared/types.ts';
 import {
@@ -29,6 +32,9 @@ import {
 } from '../ai/engine.ts';
 import { getDb, uploadsDir } from '../db/database.ts';
 import { requireAuth, requireRole, type AuthenticatedRequest } from '../middleware/auth.ts';
+import { recordAuditLog } from '../services/auditService.ts';
+import { isPrototypeMode } from '../services/authService.ts';
+import { generateEscalationLetter, LEGAL_ESCALATION_DISCLAIMER } from '../services/escalationService.ts';
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),
@@ -80,6 +86,13 @@ interface RawComplaintRow {
   english_location?: string | null;
   status: ComplaintStatus;
   is_demo: number;
+  sla_deadline?: string | null;
+  escalation_notice_generated?: number;
+  escalation_notice_sent_at?: string | null;
+  escalation_language?: string | null;
+  escalation_document?: string | null;
+  escalation_generation_method?: string | null;
+  sla_breach_simulated?: number;
   created_at: string;
   updated_at: string;
   duplicate_count?: number;
@@ -154,6 +167,18 @@ function hydrateComplaint(row: RawComplaintRow): Complaint {
     english_location: row.english_location ?? null,
     status: row.status,
     is_demo: Boolean(row.is_demo),
+    sla_deadline: row.sla_deadline || calculateSlaDeadline(row.created_at, row.priority_score),
+    escalation_notice_generated: Boolean(row.escalation_notice_generated),
+    escalation_notice_sent_at: row.escalation_notice_sent_at ?? null,
+    escalation_language: row.escalation_language ? normalizeTargetLanguage(row.escalation_language) : null,
+    escalation_document: row.escalation_document ?? null,
+    escalation_generation_method:
+      row.escalation_generation_method === 'gemini'
+        ? 'gemini'
+        : row.escalation_generation_method === 'template'
+          ? 'template'
+          : null,
+    sla_breach_simulated: Boolean(row.sla_breach_simulated),
     created_at: row.created_at,
     updated_at: row.updated_at,
     duplicate_count: row.duplicate_count ?? 0,
@@ -181,6 +206,7 @@ function buildFilteredQuery(queryParams: Record<string, unknown>) {
   const priority = typeof queryParams.priority === 'string' ? queryParams.priority.trim() : '';
   const district = typeof queryParams.district === 'string' ? queryParams.district.trim() : '';
   const status = typeof queryParams.status === 'string' ? queryParams.status.trim() : '';
+  const department = typeof queryParams.department === 'string' ? queryParams.department.trim() : '';
   const dateFrom = typeof queryParams.dateFrom === 'string' ? queryParams.dateFrom.trim() : '';
   const dateTo = typeof queryParams.dateTo === 'string' ? queryParams.dateTo.trim() : '';
 
@@ -204,6 +230,10 @@ function buildFilteredQuery(queryParams: Record<string, unknown>) {
   if (status && status !== 'All') {
     clauses.push('c.status = ?');
     params.push(status);
+  }
+  if (department && department !== 'All') {
+    clauses.push('da.department = ?');
+    params.push(department);
   }
   if (dateFrom) {
     clauses.push('date(c.created_at) >= date(?)');
@@ -240,7 +270,7 @@ apiRouter.get('/complaints', requireAuth, (req: AuthenticatedRequest, res) => {
 
     let finalWhere = whereSql;
     const finalParams = [...params];
-    if (req.authUser?.role === 'CITIZEN') {
+    if (req.authUser?.role === 'citizen') {
       finalWhere = finalWhere ? `${finalWhere} AND c.user_id = ?` : 'WHERE c.user_id = ?';
       finalParams.push(req.authUser.id);
     }
@@ -267,7 +297,17 @@ apiRouter.get('/complaints', requireAuth, (req: AuthenticatedRequest, res) => {
     `;
 
     const rows = db.prepare(sql).all(...finalParams) as RawComplaintRow[];
-    res.json({ complaints: rows.map(hydrateComplaint) });
+    let complaints = rows.map(hydrateComplaint);
+    const slaFilter = typeof req.query.slaStatus === 'string' ? req.query.slaStatus.trim() : '';
+    if (slaFilter === 'breached') {
+      complaints = complaints.filter((c) => evaluateComplaintSla(c).isBreached);
+    } else if (slaFilter === 'escalated') {
+      complaints = complaints.filter((c) => c.escalation_notice_generated);
+    } else if (slaFilter === 'within_sla') {
+      complaints = complaints.filter((c) => !evaluateComplaintSla(c).isBreached && c.status !== 'Resolved' && c.status !== 'Rejected');
+    }
+
+    res.json({ complaints });
   } catch (err) {
     console.error('Error listing complaints:', err);
     res.status(500).json({ error: 'Failed to retrieve complaints.' });
@@ -299,7 +339,7 @@ apiRouter.get('/complaints/:id', requireAuth, (req: AuthenticatedRequest, res) =
       return;
     }
 
-    if (req.authUser?.role === 'CITIZEN' && row.user_id !== req.authUser.id) {
+    if (req.authUser?.role === 'citizen' && row.user_id !== req.authUser.id) {
       res.status(403).json({ error: 'Access denied. Citizens can only inspect their own complaints.' });
       return;
     }
@@ -510,6 +550,7 @@ apiRouter.post('/complaints', requireAuth, upload.single('image'), async (req: A
     const englishLocation = analysis.englishTranslation?.location ?? location;
 
     const nowIso = new Date().toISOString();
+    const slaDeadline = calculateSlaDeadline(nowIso, analysis.priorityScore);
     const countRow = db.prepare('SELECT COALESCE(MAX(id), 0) AS maxId FROM Complaints').get() as { maxId: number };
     const nextNum = 202601 + countRow.maxId;
     const complaintCode = `CS-${nextNum}`;
@@ -523,7 +564,7 @@ apiRouter.post('/complaints', requireAuth, upload.single('image'), async (req: A
           priority_level, ai_keywords, ai_explanation, suggested_action,
           factor_breakdown, critical_safety_flag, ai_source,
           original_language, english_title, english_description, english_location,
-          status, is_demo, created_at, updated_at
+          status, is_demo, sla_deadline, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?, ?, ?,
@@ -531,7 +572,7 @@ apiRouter.post('/complaints', requireAuth, upload.single('image'), async (req: A
           ?, ?, ?, ?,
           ?, ?, ?,
           ?, ?, ?, ?,
-          'Submitted', 0, ?, ?
+          'Submitted', 0, ?, ?, ?
         )`
       )
       .run(
@@ -563,6 +604,7 @@ apiRouter.post('/complaints', requireAuth, upload.single('image'), async (req: A
         englishTitle,
         englishDescription,
         englishLocation,
+        slaDeadline,
         nowIso,
         nowIso
       );
@@ -606,7 +648,262 @@ apiRouter.post('/complaints', requireAuth, upload.single('image'), async (req: A
   }
 });
 
-apiRouter.patch('/complaints/:id', requireAuth, requireRole('ADMIN'), (req: AuthenticatedRequest, res) => {
+apiRouter.post('/complaints/:id/simulate-sla-breach', requireAuth, (req: AuthenticatedRequest, res) => {
+  try {
+    if (!isPrototypeMode()) {
+      res.status(403).json({ error: 'Demo SLA breach simulation is disabled outside prototype mode.' });
+      return;
+    }
+
+    const db = getDb();
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: 'Invalid complaint ID.' });
+      return;
+    }
+
+    const row = db
+      .prepare(
+        `SELECT c.*, u.full_name AS reporter_name, da.department AS department, da.assigned_to AS assigned_to,
+         (SELECT COUNT(*) FROM Complaint_Duplicates cd WHERE cd.complaint_id = c.id) AS duplicate_count
+         FROM Complaints c
+         LEFT JOIN Users u ON u.id = c.user_id
+         LEFT JOIN Department_Assignments da ON da.complaint_id = c.id
+         WHERE c.id = ?`
+      )
+      .get(id) as RawComplaintRow | undefined;
+
+    if (!row) {
+      res.status(404).json({ error: 'Complaint not found.' });
+      return;
+    }
+
+    if (req.authUser?.role === 'citizen' && row.user_id !== req.authUser.id) {
+      res.status(403).json({ error: 'Access denied.' });
+      return;
+    }
+
+    if (row.status === 'Resolved' || row.status === 'Rejected') {
+      res.status(400).json({ error: 'Cannot simulate SLA breach on a closed complaint.' });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const simulatedDeadline = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
+    db.prepare('UPDATE Complaints SET sla_breach_simulated = 1, sla_deadline = ?, updated_at = ? WHERE id = ?').run(
+      simulatedDeadline,
+      nowIso,
+      id
+    );
+
+    db.prepare('INSERT INTO Complaint_Updates (complaint_id, status, remarks, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)').run(
+      id,
+      row.status,
+      'Demo Mode: SLA breach simulated to test formal legal/RTI escalation workflow.',
+      `${req.authUser?.full_name ?? 'User'} (Demo)`,
+      nowIso
+    );
+
+    recordAuditLog({
+      actorId: req.authUser?.id ?? null,
+      actorName: req.authUser?.full_name ?? 'User',
+      actorRole: req.authUser?.role ?? 'citizen',
+      action: 'SLA_BREACH_SIMULATED',
+      targetType: 'complaint',
+      targetId: row.complaint_code,
+      details: `Simulated SLA breach on ${row.complaint_code} in Prototype Mode.`,
+    });
+
+    const updatedRow = db
+      .prepare(
+        `SELECT c.*, u.full_name AS reporter_name, da.department AS department, da.assigned_to AS assigned_to,
+         (SELECT COUNT(*) FROM Complaint_Duplicates cd WHERE cd.complaint_id = c.id) AS duplicate_count
+         FROM Complaints c
+         LEFT JOIN Users u ON u.id = c.user_id
+         LEFT JOIN Department_Assignments da ON da.complaint_id = c.id
+         WHERE c.id = ?`
+      )
+      .get(id) as RawComplaintRow;
+
+    res.json({ complaint: hydrateComplaint(updatedRow) });
+  } catch (err) {
+    console.error('Simulate SLA breach error:', err);
+    res.status(500).json({ error: 'Failed to simulate SLA breach.' });
+  }
+});
+
+apiRouter.post('/complaints/:id/escalation-letter', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const db = getDb();
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: 'Invalid complaint ID.' });
+      return;
+    }
+
+    const row = db
+      .prepare(
+        `SELECT c.*, u.full_name AS reporter_name, da.department AS department, da.assigned_to AS assigned_to,
+         (SELECT COUNT(*) FROM Complaint_Duplicates cd WHERE cd.complaint_id = c.id) AS duplicate_count
+         FROM Complaints c
+         LEFT JOIN Users u ON u.id = c.user_id
+         LEFT JOIN Department_Assignments da ON da.complaint_id = c.id
+         WHERE c.id = ?`
+      )
+      .get(id) as RawComplaintRow | undefined;
+
+    if (!row) {
+      res.status(404).json({ error: 'Complaint not found.' });
+      return;
+    }
+
+    if (req.authUser?.role === 'citizen' && row.user_id !== req.authUser.id) {
+      res.status(403).json({ error: 'Access denied. Citizens may only escalate their own complaints.' });
+      return;
+    }
+
+    const hydrated = hydrateComplaint(row);
+    const sla = evaluateComplaintSla(hydrated);
+    if (!sla.isBreached && !hydrated.escalation_notice_generated) {
+      res.status(400).json({
+        error: 'Formal escalation notice unlocks only after the designated SLA deadline has passed.',
+      });
+      return;
+    }
+
+    const targetLanguage = normalizeTargetLanguage(req.body?.language ?? getRequestLanguage(req));
+    const updates = db
+      .prepare('SELECT id, complaint_id, status, remarks, updated_by, updated_at FROM Complaint_Updates WHERE complaint_id = ? ORDER BY updated_at ASC, id ASC')
+      .all(id) as ComplaintDetail['updates'];
+
+    const generated = await generateEscalationLetter(hydrated, updates, targetLanguage);
+    const nowIso = new Date().toISOString();
+
+    db.prepare(
+      `UPDATE Complaints
+       SET escalation_notice_generated = 1,
+           escalation_language = ?,
+           escalation_document = ?,
+           escalation_generation_method = ?,
+           updated_at = ?
+       WHERE id = ?`
+    ).run(targetLanguage, generated.letterText, generated.generationMethod, nowIso, id);
+
+    db.prepare('INSERT INTO Complaint_Updates (complaint_id, status, remarks, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)').run(
+      id,
+      hydrated.status,
+      `Formal SLA / RTI Escalation Notice generated (${targetLanguage.toUpperCase()}, ${generated.generationMethod === 'gemini' ? 'Gemini 2.5 Flash' : 'Verified Template'}).`,
+      req.authUser?.full_name ?? 'Citizen',
+      nowIso
+    );
+
+    recordAuditLog({
+      actorId: req.authUser?.id ?? null,
+      actorName: req.authUser?.full_name ?? 'Citizen',
+      actorRole: req.authUser?.role ?? 'citizen',
+      action: 'ESCALATION_NOTICE_GENERATED',
+      targetType: 'complaint',
+      targetId: hydrated.complaint_code,
+      details: `Generated formal escalation representation for ${hydrated.complaint_code} in ${targetLanguage.toUpperCase()} via ${generated.generationMethod}.`,
+    });
+
+    const refreshedRow = db
+      .prepare(
+        `SELECT c.*, u.full_name AS reporter_name, da.department AS department, da.assigned_to AS assigned_to,
+         (SELECT COUNT(*) FROM Complaint_Duplicates cd WHERE cd.complaint_id = c.id) AS duplicate_count
+         FROM Complaints c
+         LEFT JOIN Users u ON u.id = c.user_id
+         LEFT JOIN Department_Assignments da ON da.complaint_id = c.id
+         WHERE c.id = ?`
+      )
+      .get(id) as RawComplaintRow;
+
+    const payload: EscalationLetterResponse = {
+      complaint: hydrateComplaint(refreshedRow),
+      letterText: generated.letterText,
+      language: targetLanguage,
+      generationMethod: generated.generationMethod,
+      generatedAt: nowIso,
+      legalDisclaimer: generated.legalDisclaimer || LEGAL_ESCALATION_DISCLAIMER[targetLanguage],
+    };
+
+    res.json(payload);
+  } catch (err) {
+    console.error('Escalation letter generation error:', err);
+    res.status(500).json({ error: 'Failed to generate legal escalation notice.' });
+  }
+});
+
+apiRouter.post('/complaints/:id/mark-escalation-sent', requireAuth, (req: AuthenticatedRequest, res) => {
+  try {
+    const db = getDb();
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: 'Invalid complaint ID.' });
+      return;
+    }
+    if (req.body?.confirmed !== true) {
+      res.status(400).json({ error: 'Explicit user confirmation is required before marking an escalation notice as sent.' });
+      return;
+    }
+
+    const row = db.prepare('SELECT * FROM Complaints WHERE id = ?').get(id) as RawComplaintRow | undefined;
+    if (!row) {
+      res.status(404).json({ error: 'Complaint not found.' });
+      return;
+    }
+    if (req.authUser?.role === 'citizen' && row.user_id !== req.authUser.id) {
+      res.status(403).json({ error: 'Access denied.' });
+      return;
+    }
+    if (!row.escalation_notice_generated) {
+      res.status(400).json({ error: 'Please generate the escalation notice before marking it as sent.' });
+      return;
+    }
+
+    const editedLetter = typeof req.body?.letterText === 'string' && req.body.letterText.trim() ? req.body.letterText.trim() : row.escalation_document;
+    const nowIso = new Date().toISOString();
+    db.prepare(
+      'UPDATE Complaints SET escalation_notice_sent_at = ?, escalation_document = ?, updated_at = ? WHERE id = ?'
+    ).run(nowIso, editedLetter ?? null, nowIso, id);
+
+    db.prepare('INSERT INTO Complaint_Updates (complaint_id, status, remarks, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)').run(
+      id,
+      row.status,
+      'Citizen confirmed formal Legal / SLA Escalation Notice submitted to municipal authority.',
+      req.authUser?.full_name ?? 'Citizen',
+      nowIso
+    );
+
+    recordAuditLog({
+      actorId: req.authUser?.id ?? null,
+      actorName: req.authUser?.full_name ?? 'Citizen',
+      actorRole: req.authUser?.role ?? 'citizen',
+      action: 'ESCALATION_MARKED_SENT',
+      targetType: 'complaint',
+      targetId: row.complaint_code,
+      details: `Marked formal escalation notice as dispatched for ${row.complaint_code}.`,
+    });
+
+    const refreshedRow = db
+      .prepare(
+        `SELECT c.*, u.full_name AS reporter_name, da.department AS department, da.assigned_to AS assigned_to,
+         (SELECT COUNT(*) FROM Complaint_Duplicates cd WHERE cd.complaint_id = c.id) AS duplicate_count
+         FROM Complaints c
+         LEFT JOIN Users u ON u.id = c.user_id
+         LEFT JOIN Department_Assignments da ON da.complaint_id = c.id
+         WHERE c.id = ?`
+      )
+      .get(id) as RawComplaintRow;
+
+    res.json({ complaint: hydrateComplaint(refreshedRow) });
+  } catch (err) {
+    console.error('Mark escalation sent error:', err);
+    res.status(500).json({ error: 'Failed to update escalation dispatch status.' });
+  }
+});
+
+apiRouter.patch('/complaints/:id', requireAuth, requireRole('admin', 'super_admin'), (req: AuthenticatedRequest, res) => {
   try {
     const db = getDb();
     const id = Number(req.params.id);
@@ -642,13 +939,26 @@ apiRouter.patch('/complaints/:id', requireAuth, requireRole('ADMIN'), (req: Auth
           ? `Assigned to ${department} (${assigned_to}); status set to ${nextStatus}.`
           : `Status updated to ${nextStatus}.`;
 
+    const actorRoleTag = req.authUser?.role === 'super_admin' ? 'Super Admin' : 'Admin';
     db.prepare('INSERT INTO Complaint_Updates (complaint_id, status, remarks, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)').run(
       id,
       nextStatus,
       remarkText,
-      `${req.authUser?.full_name ?? 'Administrator'} (Admin)`,
+      `${req.authUser?.full_name ?? 'Administrator'} (${actorRoleTag})`,
       nowIso
     );
+
+    if (isAdminRole(req.authUser?.role)) {
+      recordAuditLog({
+        actorId: req.authUser?.id ?? null,
+        actorName: req.authUser?.full_name ?? 'Administrator',
+        actorRole: req.authUser?.role ?? 'admin',
+        action: 'COMPLAINT_UPDATED',
+        targetType: 'complaint',
+        targetId: existing.complaint_code,
+        details: `${existing.complaint_code}: ${remarkText}`,
+      });
+    }
 
     const updatedRow = db
       .prepare(
@@ -668,7 +978,7 @@ apiRouter.patch('/complaints/:id', requireAuth, requireRole('ADMIN'), (req: Auth
   }
 });
 
-apiRouter.get('/analytics', requireAuth, requireRole('ADMIN'), (req, res) => {
+apiRouter.get('/analytics', requireAuth, requireRole('admin', 'super_admin'), (req, res) => {
   try {
     const db = getDb();
     const { whereSql, params } = buildFilteredQuery(req.query as Record<string, unknown>);
@@ -707,6 +1017,8 @@ apiRouter.get('/analytics', requireAuth, requireRole('ADMIN'), (req, res) => {
       underReview: complaints.filter((c) => c.status === 'Under Review').length,
       avgResolutionHours,
       resolutionRate: complaints.length ? Math.round((resolvedItems.length / complaints.length) * 100) : 0,
+      slaBreachedCount: complaints.filter((c) => evaluateComplaintSla(c).isBreached).length,
+      escalatedCount: complaints.filter((c) => c.escalation_notice_generated).length,
     };
 
     const byCategory = INFRASTRUCTURE_CATEGORIES.map((category) => {
@@ -835,7 +1147,7 @@ apiRouter.get('/analytics', requireAuth, requireRole('ADMIN'), (req, res) => {
   }
 });
 
-apiRouter.get('/insights', requireAuth, requireRole('ADMIN'), (req, res) => {
+apiRouter.get('/insights', requireAuth, requireRole('admin', 'super_admin'), (req, res) => {
   try {
     const db = getDb();
     const rows = db
@@ -868,7 +1180,7 @@ function escapeCsvCell(val: unknown): string {
   return str;
 }
 
-apiRouter.get('/export/csv', requireAuth, requireRole('ADMIN'), (req, res) => {
+apiRouter.get('/export/csv', requireAuth, requireRole('admin', 'super_admin'), (req, res) => {
   try {
     const db = getDb();
     const { whereSql, params } = buildFilteredQuery(req.query as Record<string, unknown>);

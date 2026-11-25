@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from 'express';
-import type { User, UserRole } from '../../shared/types.ts';
+import { normalizeUserRole, type User, type UserRole } from '../../shared/types.ts';
 import { validateSessionToken } from '../services/authService.ts';
 
 export const SESSION_COOKIE_NAME = 'civicsense_session';
@@ -40,6 +40,22 @@ export function setNoStoreHeaders(res: Response): void {
 
 export function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
   setNoStoreHeaders(res);
+
+  // CSRF check for mutating cookie-based requests without explicit Bearer header
+  const isMutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method.toUpperCase());
+  const hasBearer = Boolean(req.headers.authorization?.startsWith('Bearer '));
+  if (isMutating && !hasBearer && req.headers.cookie?.includes(SESSION_COOKIE_NAME)) {
+    const xRequested = req.headers['x-requested-with'];
+    const origin = req.headers.origin;
+    const host = req.headers.host;
+    const originMatchesHost =
+      typeof origin === 'string' && typeof host === 'string' && origin.includes(host);
+    if (!xRequested && !originMatchesHost) {
+      res.status(403).json({ error: 'Cross-site request rejected.' });
+      return;
+    }
+  }
+
   const token = extractAuthToken(req);
   const user = validateSessionToken(token);
 
@@ -54,13 +70,14 @@ export function requireAuth(req: AuthenticatedRequest, res: Response, next: Next
 }
 
 export function requireRole(...allowedRoles: UserRole[]) {
+  const normalizedAllowed = new Set(allowedRoles.map((r) => normalizeUserRole(r)));
   return (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
     setNoStoreHeaders(res);
     if (!req.authUser) {
       res.status(401).json({ error: 'Authentication required.' });
       return;
     }
-    if (!allowedRoles.includes(req.authUser.role)) {
+    if (!normalizedAllowed.has(normalizeUserRole(req.authUser.role))) {
       res.status(403).json({
         error: 'Access denied. You do not have permission to access this resource.',
       });

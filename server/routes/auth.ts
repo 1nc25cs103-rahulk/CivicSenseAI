@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from 'express';
+import { SUPPORTED_LANGUAGES, type SupportedLanguage } from '../../shared/types.ts';
 import {
   extractAuthToken,
   requireAuth,
@@ -9,12 +10,19 @@ import {
 import {
   authenticateAdmin,
   authenticateCitizen,
+  authenticateDemoAdmin,
+  authenticateUnified,
+  getAdminBootstrapStatus,
   getAllowedAdminDomains,
+  HttpAuthError,
   invalidateSession,
+  isPrototypeMode,
   registerCitizen,
+  registerInitialAdmin,
+  registerOfficial,
   updateUserLanguagePreference,
+  validateSessionToken,
 } from '../services/authService.ts';
-import { SUPPORTED_LANGUAGES, type SupportedLanguage } from '../../shared/types.ts';
 import { activeRecoveryProvider, resetPasswordWithToken } from '../services/recoveryService.ts';
 
 export const authRouter = Router();
@@ -29,7 +37,10 @@ function setSessionCookie(req: Request, res: Response, rawToken: string, expires
     `Max-Age=${maxAgeSeconds}`,
     isHttps ? 'SameSite=None' : 'SameSite=Lax',
   ];
-  if (isHttps) parts.push('Secure');
+  if (isHttps) {
+    parts.push('Secure');
+    parts.push('Partitioned');
+  }
   res.setHeader('Set-Cookie', parts.join('; '));
 }
 
@@ -42,19 +53,47 @@ function clearSessionCookie(req: Request, res: Response): void {
     'Max-Age=0',
     isHttps ? 'SameSite=None' : 'SameSite=Lax',
   ];
-  if (isHttps) parts.push('Secure');
+  if (isHttps) {
+    parts.push('Secure');
+    parts.push('Partitioned');
+  }
   res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function sendAuthError(res: Response, err: unknown, fallbackMessage: string, fallbackStatus = 400): void {
+  if (err instanceof HttpAuthError) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  const message = err instanceof Error ? err.message : fallbackMessage;
+  res.status(fallbackStatus).json({ error: message });
 }
 
 authRouter.get('/policy', (_req, res) => {
   res.json({
     allowedAdminDomains: getAllowedAdminDomains(),
+    prototypeMode: isPrototypeMode(),
   });
 });
 
-authRouter.get('/me', requireAuth, (req: AuthenticatedRequest, res) => {
+authRouter.get('/admin-bootstrap-status', (_req, res) => {
   setNoStoreHeaders(res);
-  res.json({ user: req.authUser });
+  res.json(getAdminBootstrapStatus());
+});
+
+authRouter.get('/me', (req, res) => {
+  setNoStoreHeaders(res);
+  const token = extractAuthToken(req);
+  if (!token) {
+    res.json({ authenticated: false, user: null });
+    return;
+  }
+  const user = validateSessionToken(token);
+  if (!user) {
+    res.json({ authenticated: false, user: null });
+    return;
+  }
+  res.json({ authenticated: true, user });
 });
 
 authRouter.patch('/preferences', requireAuth, (req: AuthenticatedRequest, res) => {
@@ -72,7 +111,7 @@ authRouter.patch('/preferences', requireAuth, (req: AuthenticatedRequest, res) =
     const user = updateUserLanguagePreference(req.authUser!.id, lang);
     res.json({ user });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to save language preference.' });
+    sendAuthError(res, err, 'Unable to save language preference.');
   }
 });
 
@@ -104,7 +143,111 @@ authRouter.post('/register', (req, res) => {
       user: result.user,
     });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Registration failed.' });
+    sendAuthError(res, err, 'Registration failed.');
+  }
+});
+
+authRouter.post('/register-initial-admin', (req, res) => {
+  setNoStoreHeaders(res);
+  try {
+    const {
+      full_name,
+      email,
+      employee_id,
+      designation,
+      mobile,
+      password,
+      confirmPassword,
+      security_question,
+      security_answer,
+      preferred_language,
+    } = req.body ?? {};
+
+    const session = registerInitialAdmin({
+      full_name,
+      email,
+      employee_id,
+      designation,
+      mobile,
+      password,
+      confirmPassword,
+      security_question,
+      security_answer,
+      preferred_language,
+    });
+
+    setSessionCookie(req, res, session.token, session.expiresAt);
+    res.status(201).json({
+      message: 'Super Administrator account initialized for Central Command. Public bootstrap is now permanently locked.',
+      user: session.user,
+      token: session.token,
+      expiresAt: session.expiresAt,
+    });
+  } catch (err) {
+    sendAuthError(res, err, 'Initial administrator registration failed.');
+  }
+});
+
+authRouter.post('/register-official', (req, res) => {
+  setNoStoreHeaders(res);
+  try {
+    const {
+      registration_method,
+      invite_code,
+      full_name,
+      email,
+      department,
+      employee_id,
+      designation,
+      mobile,
+      password,
+      confirmPassword,
+      security_question,
+      security_answer,
+      preferred_language,
+    } = req.body ?? {};
+
+    const result = registerOfficial({
+      registration_method,
+      invite_code,
+      full_name,
+      email,
+      department,
+      employee_id,
+      designation,
+      mobile,
+      password,
+      confirmPassword,
+      security_question,
+      security_answer,
+      preferred_language,
+    });
+
+    if (result.token && result.expiresAt) {
+      setSessionCookie(req, res, result.token, result.expiresAt);
+    }
+
+    res.status(201).json(result);
+  } catch (err) {
+    sendAuthError(res, err, 'Official registration failed.');
+  }
+});
+
+authRouter.post('/login', (req, res) => {
+  setNoStoreHeaders(res);
+  try {
+    const { email, password, portal } = req.body ?? {};
+    const expectedGroup =
+      portal === 'citizen' ? 'citizen' : portal === 'official' || portal === 'admin' ? 'official' : undefined;
+    const session = authenticateUnified(String(email ?? ''), String(password ?? ''), expectedGroup);
+    setSessionCookie(req, res, session.token, session.expiresAt);
+    res.json({
+      user: session.user,
+      token: session.token,
+      expiresAt: session.expiresAt,
+    });
+  } catch (err) {
+    sendAuthError(res, err, 'Authentication failed.', 401);
   }
 });
 
@@ -120,9 +263,7 @@ authRouter.post('/login/citizen', (req, res) => {
       expiresAt: session.expiresAt,
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Authentication failed.';
-    const status = message.includes('locked') || message.includes('Too many') ? 429 : 401;
-    res.status(status).json({ error: message });
+    sendAuthError(res, err, 'Authentication failed.', 401);
   }
 });
 
@@ -138,13 +279,22 @@ authRouter.post('/login/admin', (req, res) => {
       expiresAt: session.expiresAt,
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unauthorized administrator login attempt.';
-    const status = message.includes('locked')
-      ? 429
-      : message.includes('not permitted') || message.includes('not authorized')
-        ? 403
-        : 401;
-    res.status(status).json({ error: message });
+    sendAuthError(res, err, 'Unauthorized administrator login attempt.', 401);
+  }
+});
+
+authRouter.post('/demo-admin', (req, res) => {
+  setNoStoreHeaders(res);
+  try {
+    const session = authenticateDemoAdmin();
+    setSessionCookie(req, res, session.token, session.expiresAt);
+    res.json({
+      user: session.user,
+      token: session.token,
+      expiresAt: session.expiresAt,
+    });
+  } catch (err) {
+    sendAuthError(res, err, 'Demo admin login unavailable.', 403);
   }
 });
 
@@ -158,7 +308,7 @@ authRouter.post('/logout', (req, res) => {
   res.json({ message: 'Logged out successfully.' });
 });
 
-authRouter.post('/forgot-password/question', async (req, res) => {
+async function handleForgotPasswordInitiate(req: Request, res: Response) {
   setNoStoreHeaders(res);
   try {
     const { email } = req.body ?? {};
@@ -169,9 +319,9 @@ authRouter.post('/forgot-password/question', async (req, res) => {
     const status = message.includes('blocked') ? 429 : 400;
     res.status(status).json({ error: message });
   }
-});
+}
 
-authRouter.post('/forgot-password/verify', async (req, res) => {
+async function handleVerifySecurityAnswer(req: Request, res: Response) {
   setNoStoreHeaders(res);
   try {
     const { challengeToken, answer } = req.body ?? {};
@@ -182,9 +332,9 @@ authRouter.post('/forgot-password/verify', async (req, res) => {
     const status = message.includes('blocked') ? 429 : 400;
     res.status(status).json({ error: message });
   }
-});
+}
 
-authRouter.post('/forgot-password/reset', (req, res) => {
+function handleResetPassword(req: Request, res: Response) {
   setNoStoreHeaders(res);
   try {
     const { resetToken, newPassword, confirmPassword } = req.body ?? {};
@@ -201,4 +351,13 @@ authRouter.post('/forgot-password/reset', (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : 'Password reset failed.' });
   }
-});
+}
+
+authRouter.post('/forgot-password', handleForgotPasswordInitiate);
+authRouter.post('/forgot-password/question', handleForgotPasswordInitiate);
+
+authRouter.post('/verify-security-answer', handleVerifySecurityAnswer);
+authRouter.post('/forgot-password/verify', handleVerifySecurityAnswer);
+
+authRouter.post('/reset-password', handleResetPassword);
+authRouter.post('/forgot-password/reset', handleResetPassword);

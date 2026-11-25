@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
@@ -7,7 +7,10 @@ import {
   FilePlus2,
   ImagePlus,
   LogOut,
+  Mic,
+  MicOff,
   RefreshCw,
+  Scale,
   Search,
   Sparkles,
   Trash2,
@@ -15,8 +18,10 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
+  fetchAuthPolicy,
   fetchComplaintDetail,
   previewComplaintAnalysis,
+  simulateSlaBreachApi,
   submitComplaintOnline,
 } from '../../lib/api.ts';
 import {
@@ -48,6 +53,8 @@ import { PriorityIndicator, StatusIndicator } from '../common/SemanticIndicators
 import { KarnatakaMap } from '../maps/KarnatakaMap.tsx';
 import { AIAnalysisPanel } from './AIAnalysisPanel.tsx';
 import { ComplaintTimelineModal } from './ComplaintTimelineModal.tsx';
+import { EscalationLetterModal } from './EscalationLetterModal.tsx';
+import { SlaCountdownCard } from './SlaCountdownCard.tsx';
 
 interface CitizenPortalProps {
   user: User;
@@ -108,6 +115,103 @@ export const CitizenPortal: React.FC<CitizenPortalProps> = ({
   const [trackCategory, setTrackCategory] = useState<string>('All');
   const [selectedDetail, setSelectedDetail] = useState<ComplaintDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+
+  // SLA, Legal Escalation & Voice Dictation State
+  const [prototypeMode, setPrototypeMode] = useState(true);
+  const [simulatingId, setSimulatingId] = useState<number | null>(null);
+  const [escalationComplaint, setEscalationComplaint] = useState<Complaint | null>(null);
+  const [slaFeedback, setSlaFeedback] = useState<string | null>(null);
+  const [listeningVoice, setListeningVoice] = useState(false);
+  const recognitionRef = useRef<{ stop: () => void } | null>(null);
+
+  useEffect(() => {
+    fetchAuthPolicy()
+      .then((p) => setPrototypeMode(p.prototypeMode))
+      .catch(() => {});
+    return () => {
+      recognitionRef.current?.stop();
+    };
+  }, []);
+
+  const handleToggleVoiceInput = () => {
+    setFormError(null);
+    if (listeningVoice) {
+      recognitionRef.current?.stop();
+      setListeningVoice(false);
+      return;
+    }
+
+    const win = window as unknown as {
+      SpeechRecognition?: new () => {
+        lang: string;
+        continuous: boolean;
+        interimResults: boolean;
+        onresult: ((e: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
+        onerror: (() => void) | null;
+        onend: (() => void) | null;
+        start: () => void;
+        stop: () => void;
+      };
+      webkitSpeechRecognition?: new () => {
+        lang: string;
+        continuous: boolean;
+        interimResults: boolean;
+        onresult: ((e: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
+        onerror: (() => void) | null;
+        onend: (() => void) | null;
+        start: () => void;
+        stop: () => void;
+      };
+    };
+
+    const RecognitionCtor = win.SpeechRecognition || win.webkitSpeechRecognition;
+    if (!RecognitionCtor) {
+      setFormError('Voice dictation requires a Chromium or Safari browser with Web Speech API support.');
+      return;
+    }
+
+    const recognition = new RecognitionCtor();
+    recognition.lang = i18n.language === 'kn' ? 'kn-IN' : i18n.language === 'hi' ? 'hi-IN' : 'en-IN';
+    recognition.continuous = false;
+    recognition.interimResults = false;
+
+    recognition.onresult = (event) => {
+      let transcript = '';
+      for (let i = 0; i < event.results.length; i++) {
+        transcript += `${event.results[i][0]?.transcript ?? ''} `;
+      }
+      const clean = transcript.trim();
+      if (clean) {
+        setDescription((prev) => (prev ? `${prev} ${clean}` : clean));
+      }
+    };
+    recognition.onerror = () => {
+      setListeningVoice(false);
+    };
+    recognition.onend = () => {
+      setListeningVoice(false);
+    };
+
+    recognitionRef.current = recognition;
+    setListeningVoice(true);
+    recognition.start();
+  };
+
+  const handleSimulateSlaBreach = async (complaint: Complaint) => {
+    setSimulatingId(complaint.id);
+    setSlaFeedback(null);
+    try {
+      await simulateSlaBreachApi(complaint.id);
+      await onRefreshData();
+      setSlaFeedback(
+        `Demo SLA breach activated on ${complaint.complaint_code}. You can now generate the Formal Escalation / RTI Notice.`
+      );
+    } catch (err) {
+      setSlaFeedback(err instanceof Error ? err.message : 'Unable to simulate SLA breach.');
+    } finally {
+      setSimulatingId(null);
+    }
+  };
 
   // Refresh open timeline modal when active UI language changes so AI narratives re-localize
   useEffect(() => {
@@ -412,6 +516,7 @@ export const CitizenPortal: React.FC<CitizenPortalProps> = ({
           <div className="flex items-center gap-2.5 shrink-0">
             <LanguageSelector
               variant="light"
+              isAuthenticated
               onLanguageUpdated={(_lang, updatedUser) => {
                 if (updatedUser) onUserUpdated?.(updatedUser);
               }}
@@ -551,6 +656,49 @@ export const CitizenPortal: React.FC<CitizenPortalProps> = ({
                       </button>
                     </div>
                   ))}
+                </div>
+              </div>
+            )}
+
+            {/* Live SLA Accountability & Legal Escalation Cards */}
+            {complaints.length > 0 && (
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Scale className="h-4 w-4 text-teal-700" />
+                    <h2 className="font-display text-base font-bold text-slate-900">
+                      {t('sla.sectionTitle')}
+                    </h2>
+                  </div>
+                  <span className="text-xs text-slate-500">
+                    Critical: 48h · High: 7d · Normal: 15d
+                  </span>
+                </div>
+
+                {slaFeedback && (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs font-medium text-amber-950">
+                    {slaFeedback}
+                  </div>
+                )}
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  {complaints
+                    .filter((c) => c.status !== 'Resolved' && c.status !== 'Rejected')
+                    .slice(0, 4)
+                    .map((c) => (
+                      <SlaCountdownCard
+                        key={c.id}
+                        complaint={c}
+                        prototypeMode={prototypeMode}
+                        simulatingId={simulatingId}
+                        onSimulateBreach={(item) => void handleSimulateSlaBreach(item)}
+                        onOpenEscalation={(item) => setEscalationComplaint(item)}
+                        onInspectTimeline={(id) => {
+                          const target = complaints.find((x) => x.id === id);
+                          if (target) void openTimeline(target);
+                        }}
+                      />
+                    ))}
                 </div>
               </div>
             )}
@@ -697,9 +845,23 @@ export const CitizenPortal: React.FC<CitizenPortalProps> = ({
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700" htmlFor="complaint-desc">
-                    {t('citizen.submit.descLabel')}
-                  </label>
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="block text-xs font-semibold text-slate-700" htmlFor="complaint-desc">
+                      {t('citizen.submit.descLabel')}
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleToggleVoiceInput}
+                      className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] font-semibold transition-colors cursor-pointer ${
+                        listeningVoice
+                          ? 'border-red-300 bg-red-50 text-red-700'
+                          : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
+                      }`}
+                    >
+                      {listeningVoice ? <MicOff className="h-3.5 w-3.5" /> : <Mic className="h-3.5 w-3.5 text-teal-700" />}
+                      <span>{listeningVoice ? t('sla.voiceListening') : t('sla.voiceDictate')}</span>
+                    </button>
+                  </div>
                   <textarea
                     id="complaint-desc"
                     rows={4}
@@ -1078,6 +1240,33 @@ export const CitizenPortal: React.FC<CitizenPortalProps> = ({
                 </table>
               </div>
             </div>
+
+            {/* Live SLA Action Cards for Filtered Complaints */}
+            {filteredTrackList.some((c) => c.status !== 'Resolved' && c.status !== 'Rejected') && (
+              <div className="space-y-3">
+                <h3 className="font-display text-sm font-bold text-slate-900">
+                  Active SLA Countdowns & Escalation Actions
+                </h3>
+                <div className="grid gap-3 md:grid-cols-2">
+                  {filteredTrackList
+                    .filter((c) => c.status !== 'Resolved' && c.status !== 'Rejected')
+                    .map((c) => (
+                      <SlaCountdownCard
+                        key={c.id}
+                        complaint={c}
+                        prototypeMode={prototypeMode}
+                        simulatingId={simulatingId}
+                        onSimulateBreach={(item) => void handleSimulateSlaBreach(item)}
+                        onOpenEscalation={(item) => setEscalationComplaint(item)}
+                        onInspectTimeline={(id) => {
+                          const target = complaints.find((x) => x.id === id);
+                          if (target) void openTimeline(target);
+                        }}
+                      />
+                    ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </main>
@@ -1088,6 +1277,15 @@ export const CitizenPortal: React.FC<CitizenPortalProps> = ({
         onClose={() => {
           setSelectedDetail(null);
           setDetailLoading(false);
+        }}
+      />
+
+      <EscalationLetterModal
+        complaint={escalationComplaint}
+        onClose={() => setEscalationComplaint(null)}
+        onComplaintUpdated={(updated) => {
+          setEscalationComplaint(updated);
+          void onRefreshData();
         }}
       />
     </div>

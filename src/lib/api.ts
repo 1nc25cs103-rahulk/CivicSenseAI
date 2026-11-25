@@ -1,25 +1,33 @@
 import { getCurrentLanguage } from '../i18n/index.ts';
 import type {
+  AccountStatus,
+  AdminBootstrapStatus,
+  AdminInvite,
   AIAnalysisResult,
   AnalyticsResponse,
+  AuditLogEntry,
   AuthSessionResponse,
   Complaint,
   ComplaintDetail,
+  EscalationLetterResponse,
   InsightsResponse,
   OfflineDraftComplaint,
+  PublicHotspotsResponse,
+  PublicStatsResponse,
   SupportedLanguage,
   User,
 } from '../types/index.ts';
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '');
 
-const AUTH_TOKEN_KEY = 'civicsense_auth_token';
-
 const CACHE_KEYS = {
   complaints: 'civicsense_cache_complaints',
   analytics: 'civicsense_cache_analytics',
   insights: 'civicsense_cache_insights',
 };
+
+// Keep bearer token strictly in memory; reload persistence uses the HttpOnly session cookie.
+let inMemoryAuthToken: string | null = null;
 
 type UnauthorizedListener = () => void;
 const unauthorizedListeners = new Set<UnauthorizedListener>();
@@ -37,28 +45,17 @@ function notifyUnauthorized(): void {
 }
 
 export function getStoredToken(): string | null {
-  try {
-    return localStorage.getItem(AUTH_TOKEN_KEY);
-  } catch {
-    return null;
-  }
+  return inMemoryAuthToken;
 }
 
 export function setStoredToken(token: string | null): void {
-  try {
-    if (token) {
-      localStorage.setItem(AUTH_TOKEN_KEY, token);
-    } else {
-      localStorage.removeItem(AUTH_TOKEN_KEY);
-    }
-  } catch {
-    // Ignore storage access errors
-  }
+  inMemoryAuthToken = token;
 }
 
 export function clearAuthAndCache(): void {
+  inMemoryAuthToken = null;
   try {
-    localStorage.removeItem(AUTH_TOKEN_KEY);
+    localStorage.removeItem('civicsense_auth_token');
     localStorage.removeItem(CACHE_KEYS.complaints);
     localStorage.removeItem(CACHE_KEYS.analytics);
     localStorage.removeItem(CACHE_KEYS.insights);
@@ -71,11 +68,10 @@ function buildAuthHeaders(extra: Record<string, string> = {}): Record<string, st
   const token = getStoredToken();
   const baseHeaders: Record<string, string> = {
     'Accept-Language': getCurrentLanguage(),
+    'X-Requested-With': 'CivicSense',
     ...extra,
   };
-  return token
-    ? { ...baseHeaders, Authorization: `Bearer ${token}` }
-    : baseHeaders;
+  return token ? { ...baseHeaders, Authorization: `Bearer ${token}` } : baseHeaders;
 }
 
 async function apiFetch(input: string, init: RequestInit = {}, notifyOn401 = true): Promise<Response> {
@@ -116,6 +112,8 @@ export interface ComplaintFilters {
   priority?: string;
   district?: string;
   status?: string;
+  department?: string;
+  slaStatus?: string;
   sortBy?: 'priority' | 'date' | 'severity';
   sortDir?: 'asc' | 'desc';
   dateFrom?: string;
@@ -131,16 +129,41 @@ function toQueryString(params: Record<string, string | undefined>): string {
   return s ? `?${s}` : '';
 }
 
+// --- Public Telemetry & Hotspots ---
+
+export async function fetchPublicStats(): Promise<PublicStatsResponse> {
+  const res = await apiFetch('/api/public/stats', {}, false);
+  if (!res.ok) throw new Error('Unable to load public stats.');
+  return res.json();
+}
+
+export async function fetchPublicHotspots(filters: { district?: string; category?: string } = {}): Promise<PublicHotspotsResponse> {
+  const qs = toQueryString({ district: filters.district, category: filters.category });
+  const res = await apiFetch(`/api/public/hotspots${qs}`, {}, false);
+  if (!res.ok) throw new Error('Unable to load public hotspots.');
+  return res.json();
+}
+
 export async function fetchHealth(): Promise<{ status: string; aiMode: 'rules' | 'hybrid-gemini'; complaintsCount: number }> {
   const res = await apiFetch('/api/health', {}, false);
   if (!res.ok) throw new Error('Health check failed');
   return res.json();
 }
 
-export async function fetchAuthPolicy(): Promise<{ allowedAdminDomains: string[] }> {
+// --- Auth, Bootstrap & Two-Tier Official Onboarding ---
+
+export async function fetchAuthPolicy(): Promise<{ allowedAdminDomains: string[]; prototypeMode: boolean }> {
   const res = await apiFetch('/api/auth/policy', {}, false);
   if (!res.ok) {
-    return { allowedAdminDomains: ['civicsense.gov.in', 'karnataka.gov.in'] };
+    return { allowedAdminDomains: ['bbmp.gov.in', 'karnataka.gov.in', 'civicsense.gov.in'], prototypeMode: true };
+  }
+  return res.json();
+}
+
+export async function fetchAdminBootstrapStatus(): Promise<AdminBootstrapStatus> {
+  const res = await apiFetch('/api/auth/admin-bootstrap-status', {}, false);
+  if (!res.ok) {
+    throw new Error('Failed to load administrator bootstrap status.');
   }
   return res.json();
 }
@@ -203,19 +226,94 @@ export async function registerCitizenApi(payload: {
   return data as { message: string; user: User };
 }
 
-export async function loginCitizenApi(email: string, password: string): Promise<AuthSessionResponse> {
+export async function registerInitialAdminApi(payload: {
+  full_name: string;
+  email: string;
+  employee_id: string;
+  designation: string;
+  mobile?: string;
+  password: string;
+  confirmPassword: string;
+  security_question: string;
+  security_answer: string;
+  preferred_language?: SupportedLanguage;
+}): Promise<AuthSessionResponse & { message: string }> {
   const res = await apiFetch(
-    '/api/auth/login/citizen',
+    '/api/auth/register-initial-admin',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({
+        ...payload,
+        preferred_language: payload.preferred_language ?? getCurrentLanguage(),
+      }),
     },
     false
   );
   const data = await res.json();
   if (!res.ok) {
-    throw new Error(data.error || 'Invalid citizen credentials.');
+    throw new Error(data.error || 'Initial Super Administrator setup failed.');
+  }
+  clearAuthAndCache();
+  setStoredToken(data.token);
+  return data as AuthSessionResponse & { message: string };
+}
+
+export async function registerOfficialApi(payload: {
+  registration_method: 'invite' | 'email';
+  invite_code?: string;
+  full_name: string;
+  email: string;
+  department: string;
+  employee_id: string;
+  designation: string;
+  mobile?: string;
+  password: string;
+  confirmPassword: string;
+  security_question: string;
+  security_answer: string;
+  preferred_language?: SupportedLanguage;
+}): Promise<{ user: User; status: 'active' | 'pending'; message: string; token?: string; expiresAt?: string }> {
+  const res = await apiFetch(
+    '/api/auth/register-official',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...payload,
+        preferred_language: payload.preferred_language ?? getCurrentLanguage(),
+      }),
+    },
+    false
+  );
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Official registration failed.');
+  }
+  if (data.token) {
+    clearAuthAndCache();
+    setStoredToken(data.token);
+  }
+  return data as { user: User; status: 'active' | 'pending'; message: string; token?: string; expiresAt?: string };
+}
+
+export async function loginUnifiedApi(
+  email: string,
+  password: string,
+  portal?: 'citizen' | 'official'
+): Promise<AuthSessionResponse> {
+  const res = await apiFetch(
+    '/api/auth/login',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, portal }),
+    },
+    false
+  );
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Invalid credentials.');
   }
   const session = data as AuthSessionResponse;
   clearAuthAndCache();
@@ -223,19 +321,19 @@ export async function loginCitizenApi(email: string, password: string): Promise<
   return session;
 }
 
+export async function loginCitizenApi(email: string, password: string): Promise<AuthSessionResponse> {
+  return loginUnifiedApi(email, password, 'citizen');
+}
+
 export async function loginAdminApi(email: string, password: string): Promise<AuthSessionResponse> {
-  const res = await apiFetch(
-    '/api/auth/login/admin',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }),
-    },
-    false
-  );
+  return loginUnifiedApi(email, password, 'official');
+}
+
+export async function loginDemoAdminApi(): Promise<AuthSessionResponse> {
+  const res = await apiFetch('/api/auth/demo-admin', { method: 'POST' }, false);
   const data = await res.json();
   if (!res.ok) {
-    throw new Error(data.error || 'Unauthorized administrator login.');
+    throw new Error(data.error || 'Demo administrator login unavailable.');
   }
   const session = data as AuthSessionResponse;
   clearAuthAndCache();
@@ -259,7 +357,7 @@ export async function requestSecurityQuestionApi(email: string): Promise<{
   expiresAt: string;
 }> {
   const res = await apiFetch(
-    '/api/auth/forgot-password/question',
+    '/api/auth/forgot-password',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -279,7 +377,7 @@ export async function verifySecurityAnswerApi(
   answer: string
 ): Promise<{ verified: boolean; resetToken: string }> {
   const res = await apiFetch(
-    '/api/auth/forgot-password/verify',
+    '/api/auth/verify-security-answer',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -300,7 +398,7 @@ export async function resetPasswordApi(
   confirmPassword: string
 ): Promise<{ success: boolean; message: string }> {
   const res = await apiFetch(
-    '/api/auth/forgot-password/reset',
+    '/api/auth/reset-password',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -316,6 +414,83 @@ export async function resetPasswordApi(
   return data as { success: boolean; message: string };
 }
 
+// --- Admin Provisioning, Audit & Settings ---
+
+export async function fetchAdminInvites(): Promise<AdminInvite[]> {
+  const res = await apiFetch('/api/admin/invites');
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to load invite codes.');
+  return data.invites as AdminInvite[];
+}
+
+export async function createAdminInviteApi(department: string, expiresInDays = 7): Promise<AdminInvite> {
+  const res = await apiFetch('/api/admin/invites', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ department, expiresInDays }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to generate invite code.');
+  return data.invite as AdminInvite;
+}
+
+export async function revokeAdminInviteApi(inviteId: number): Promise<void> {
+  const res = await apiFetch(`/api/admin/invites/${inviteId}`, { method: 'DELETE' });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to revoke invite code.');
+}
+
+export async function fetchOfficersApi(): Promise<Array<User & { approver_name?: string | null }>> {
+  const res = await apiFetch('/api/admin/officers');
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to load official accounts.');
+  return data.officers as Array<User & { approver_name?: string | null }>;
+}
+
+export async function updateOfficerStatusApi(officerId: number, account_status: AccountStatus): Promise<User> {
+  const res = await apiFetch(`/api/admin/officers/${officerId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ account_status }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to update official account status.');
+  return data.officer as User;
+}
+
+export async function fetchAuditLogsApi(filters: { search?: string; action?: string } = {}): Promise<AuditLogEntry[]> {
+  const qs = toQueryString({ search: filters.search, action: filters.action });
+  const res = await apiFetch(`/api/admin/audit-logs${qs}`);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to load audit logs.');
+  return data.logs as AuditLogEntry[];
+}
+
+export interface AdminSettingsResponse {
+  prototypeMode: boolean;
+  aiMode: 'rules' | 'hybrid-gemini';
+  allowedAdminDomains: string[];
+  slaPolicy: {
+    critical: { minScore: number; maxScore: number; windowHours: number; label: string };
+    high: { minScore: number; maxScore: number; windowHours: number; label: string };
+    normal: { minScore: number; maxScore: number; windowHours: number; label: string };
+  };
+  counts: {
+    totalComplaints: number;
+    totalUsers: number;
+    activeInvites: number;
+  };
+}
+
+export async function fetchAdminSettingsApi(): Promise<AdminSettingsResponse> {
+  const res = await apiFetch('/api/admin/settings');
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to load system settings.');
+  return data as AdminSettingsResponse;
+}
+
+// --- Complaints, SLA & Legal Escalation ---
+
 export async function fetchComplaints(filters: ComplaintFilters = {}): Promise<{ complaints: Complaint[]; fromCache: boolean }> {
   const qs = toQueryString({
     search: filters.search,
@@ -323,6 +498,8 @@ export async function fetchComplaints(filters: ComplaintFilters = {}): Promise<{
     priority: filters.priority,
     district: filters.district,
     status: filters.status,
+    department: filters.department,
+    slaStatus: filters.slaStatus,
     sortBy: filters.sortBy,
     sortDir: filters.sortDir,
     dateFrom: filters.dateFrom,
@@ -407,6 +584,49 @@ export async function syncOfflineDraftToServer(draft: OfflineDraftComplaint): Pr
   return data as { complaint: Complaint; aiAnalysis: AIAnalysisResult };
 }
 
+export async function simulateSlaBreachApi(complaintId: number): Promise<Complaint> {
+  const res = await apiFetch(`/api/complaints/${complaintId}/simulate-sla-breach`, {
+    method: 'POST',
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to simulate SLA breach.');
+  }
+  return data.complaint as Complaint;
+}
+
+export async function generateEscalationLetterApi(
+  complaintId: number,
+  language: SupportedLanguage
+): Promise<EscalationLetterResponse> {
+  const res = await apiFetch(`/api/complaints/${complaintId}/escalation-letter`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ language }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to generate escalation notice.');
+  }
+  return data as EscalationLetterResponse;
+}
+
+export async function markEscalationSentApi(
+  complaintId: number,
+  letterText: string
+): Promise<Complaint> {
+  const res = await apiFetch(`/api/complaints/${complaintId}/mark-escalation-sent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ confirmed: true, letterText }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to mark escalation as sent.');
+  }
+  return data.complaint as Complaint;
+}
+
 export async function updateComplaintAdmin(
   id: number,
   payload: {
@@ -480,6 +700,8 @@ export async function downloadComplaintsCsv(filters: ComplaintFilters = {}): Pro
     priority: filters.priority,
     district: filters.district,
     status: filters.status,
+    department: filters.department,
+    slaStatus: filters.slaStatus,
     dateFrom: filters.dateFrom,
     dateTo: filters.dateTo,
   });

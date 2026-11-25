@@ -20,4 +20,15 @@ export interface OfflineDraftComplaint {
 }
 
 export type CitizenTab = 'dashboard' | 'submit' | 'track';
-export type AdminTab = 'overview' | 'management' | 'hotspots' | 'analytics' | 'insights';
+
+export type AdminTab =
+  | 'overview'
+  | 'management'
+  | 'ai_monitoring'
+  | 'departments'
+  | 'provisioning'
+  | 'sla_breaches'
+  | 'escalations'
+  | 'analytics'
+  | 'audit_logs'
+  | 'settings';

@@ -23,8 +23,21 @@ export type ComplaintStatus = (typeof COMPLAINT_STATUSES)[number];
 
 export type PriorityLevel = 'Critical' | 'High' | 'Medium' | 'Low';
 export type SeverityLevel = 'Critical' | 'High' | 'Medium' | 'Low';
-export type UserRole = 'CITIZEN' | 'ADMIN';
+export type UserRole = 'citizen' | 'admin' | 'super_admin';
 export type AccountStatus = 'active' | 'pending' | 'suspended';
+export type SlaState = 'within_sla' | 'approaching' | 'breached' | 'escalated' | 'resolved';
+
+export function normalizeUserRole(role: string | null | undefined): UserRole {
+  const lower = String(role ?? '').trim().toLowerCase();
+  if (lower === 'super_admin') return 'super_admin';
+  if (lower === 'admin') return 'admin';
+  return 'citizen';
+}
+
+export function isAdminRole(role: string | null | undefined): boolean {
+  const normalized = normalizeUserRole(role);
+  return normalized === 'admin' || normalized === 'super_admin';
+}
 
 export const SUPPORTED_LANGUAGES = ['en', 'kn', 'hi'] as const;
 export type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
@@ -38,12 +51,14 @@ export const SUGGESTED_SECURITY_QUESTIONS = [
 
 export type AuthRoute =
   | '/'
+  | '/auth'
+  | '/dashboard'
+  | '/citizen'
+  | '/admin'
   | '/login/citizen'
   | '/register/citizen'
   | '/login/admin'
-  | '/forgot-password'
-  | '/citizen'
-  | '/admin';
+  | '/forgot-password';
 
 export interface DistrictPreset {
   name: string;
@@ -129,12 +144,18 @@ export const MUNICIPAL_DEPARTMENTS = [
   'General Civic Grievance Cell',
 ] as const;
 
+export const OFFICIAL_DEPARTMENTS = ['Central Command', ...MUNICIPAL_DEPARTMENTS] as const;
+
 export interface User {
   id: number;
   full_name: string;
   email: string;
   mobile: string;
   role: UserRole;
+  department?: string | null;
+  employee_id?: string | null;
+  designation?: string | null;
+  approved_by?: number | null;
   account_status: AccountStatus;
   preferred_language?: SupportedLanguage;
   security_question?: string;
@@ -146,6 +167,84 @@ export interface AuthSessionResponse {
   user: User;
   token: string;
   expiresAt: string;
+}
+
+export interface AdminBootstrapStatus {
+  bootstrapAvailable: boolean;
+  prototypeMode: boolean;
+  demoAdminEnabled: boolean;
+  allowedAdminDomains: string[];
+  officialCount: number;
+}
+
+export interface AdminInvite {
+  id: number;
+  code: string;
+  department: string;
+  created_by: number;
+  created_by_name?: string;
+  used_by: number | null;
+  used_by_name?: string | null;
+  created_at: string;
+  expires_at: string;
+  used_at: string | null;
+  revoked_at: string | null;
+  status: 'active' | 'used' | 'expired' | 'revoked';
+}
+
+export interface AuditLogEntry {
+  id: number;
+  actor_id: number | null;
+  actor_name: string;
+  actor_role: string;
+  action: string;
+  target_type: string;
+  target_id: string | null;
+  details: string;
+  created_at: string;
+}
+
+export interface PublicStatsResponse {
+  totalIssues: number;
+  resolvedIssues: number;
+  criticalIssues: number;
+  avgTriageTimeSeconds: number;
+  slaComplianceRate: number;
+  activeWards: number;
+  isDemoSeeded: boolean;
+  updatedAt: string;
+}
+
+export interface PublicHotspotItem {
+  id: number;
+  complaint_code: string;
+  title: string;
+  category: InfrastructureCategory;
+  district: string;
+  locality: string;
+  latitude: number;
+  longitude: number;
+  priority_score: number;
+  priority_level: PriorityLevel;
+  status: ComplaintStatus;
+  created_at: string;
+  sla_deadline: string;
+  sla_breached: boolean;
+}
+
+export interface PublicHotspotsResponse {
+  items: PublicHotspotItem[];
+  hotspots: Array<{
+    district: string;
+    locality: string;
+    latitude: number;
+    longitude: number;
+    count: number;
+    criticalCount: number;
+    maxPriority: number;
+    topCategory: string;
+  }>;
+  isDemoSeeded: boolean;
 }
 
 export interface PriorityFactorBreakdown {
@@ -219,6 +318,13 @@ export interface Complaint {
   english_location?: string | null;
   status: ComplaintStatus;
   is_demo: boolean;
+  sla_deadline: string;
+  escalation_notice_generated: boolean;
+  escalation_notice_sent_at: string | null;
+  escalation_language: SupportedLanguage | null;
+  escalation_document: string | null;
+  escalation_generation_method: 'gemini' | 'template' | null;
+  sla_breach_simulated: boolean;
   created_at: string;
   updated_at: string;
   duplicate_count?: number;
@@ -232,6 +338,15 @@ export interface ComplaintDetail extends Complaint {
   assignment: DepartmentAssignment | null;
   updates: ComplaintUpdate[];
   area_complaint_count: number;
+}
+
+export interface EscalationLetterResponse {
+  complaint: Complaint;
+  letterText: string;
+  language: SupportedLanguage;
+  generationMethod: 'gemini' | 'template';
+  generatedAt: string;
+  legalDisclaimer: string;
 }
 
 export interface AIAnalysisResult {
@@ -268,6 +383,8 @@ export interface AnalyticsResponse {
     underReview: number;
     avgResolutionHours: number;
     resolutionRate: number;
+    slaBreachedCount?: number;
+    escalatedCount?: number;
   };
   byCategory: Array<{ category: string; count: number; criticalCount: number; resolvedCount: number }>;
   byDistrict: Array<{ district: string; count: number; criticalCount: number; resolvedCount: number; avgPriority: number }>;

@@ -59,3 +59,7 @@ export function translateDistrict(t: TFunction, district: string): string {
 export function translateLanguageName(t: TFunction, langCode: string): string {
   return t(`languages.${langCode}`, { defaultValue: langCode.toUpperCase() });
 }
+
+export function translateSecurityQuestion(t: TFunction, question: string): string {
+  return t(`securityQuestions.${question}`, { defaultValue: question });
+}

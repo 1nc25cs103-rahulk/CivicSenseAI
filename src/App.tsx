@@ -1,13 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AdminLoginForm } from './components/auth/AdminLoginForm.tsx';
-import { AuthLandingPage } from './components/auth/AuthLandingPage.tsx';
-import { CitizenLoginForm } from './components/auth/CitizenLoginForm.tsx';
-import { CitizenRegisterForm } from './components/auth/CitizenRegisterForm.tsx';
-import { ForgotPasswordFlow } from './components/auth/ForgotPasswordFlow.tsx';
 import { AdminDashboard } from './components/admin/AdminDashboard.tsx';
+import { UnifiedAuthPortal, type AuthPortalTab } from './components/auth/UnifiedAuthPortal.tsx';
 import { CitizenPortal } from './components/citizen/CitizenPortal.tsx';
 import { OfflineBanner } from './components/common/OfflineBanner.tsx';
+import { PublicLandingPage } from './components/public/PublicLandingPage.tsx';
 import { useOnlineStatus } from './hooks/useOnlineStatus.ts';
 import {
   consumeManualLanguageSelection,
@@ -18,7 +15,6 @@ import {
 import {
   fetchComplaints,
   fetchCurrentUser,
-  fetchHealth,
   logoutApi,
   subscribeUnauthorized,
   syncOfflineDraftToServer,
@@ -26,20 +22,27 @@ import {
 } from './lib/api.ts';
 import { getOfflineDrafts, removeOfflineDraft } from './lib/offlineQueue.ts';
 import type { AuthRoute, Complaint, OfflineDraftComplaint, User } from './types/index.ts';
+import { isAdminRole } from './types/index.ts';
 
 const VALID_ROUTES = new Set<AuthRoute>([
   '/',
+  '/auth',
+  '/dashboard',
+  '/citizen',
+  '/admin',
   '/login/citizen',
   '/register/citizen',
   '/login/admin',
   '/forgot-password',
-  '/citizen',
-  '/admin',
 ]);
 
 function normalizePath(pathname: string): AuthRoute {
   const trimmed = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
   return VALID_ROUTES.has(trimmed as AuthRoute) ? (trimmed as AuthRoute) : '/';
+}
+
+function isCitizenRoute(route: AuthRoute): boolean {
+  return route === '/dashboard' || route === '/citizen';
 }
 
 export default function App() {
@@ -52,7 +55,6 @@ export default function App() {
 
   const [complaints, setComplaints] = useState<Complaint[]>([]);
   const [loading, setLoading] = useState(false);
-  const [aiMode, setAiMode] = useState<'rules' | 'hybrid-gemini'>('rules');
   const [offlineDrafts, setOfflineDrafts] = useState<OfflineDraftComplaint[]>([]);
   const [isSyncing, setIsSyncing] = useState(false);
 
@@ -118,7 +120,7 @@ export default function App() {
     [loadDrafts, user?.id]
   );
 
-  // Initial session validation & health probe
+  // Initial session validation
   useEffect(() => {
     let active = true;
     const init = async () => {
@@ -136,12 +138,12 @@ export default function App() {
 
         const currentPath = normalizePath(window.location.pathname);
         if (!current) {
-          if (currentPath === '/citizen' || currentPath === '/admin') {
-            navigate('/', true);
+          if (isCitizenRoute(currentPath) || currentPath === '/admin') {
+            navigate('/auth', true);
           }
-        } else if (current.role === 'CITIZEN' && currentPath === '/admin') {
-          navigate('/citizen', true);
-        } else if (current.role === 'ADMIN' && currentPath === '/citizen') {
+        } else if (!isAdminRole(current.role) && currentPath === '/admin') {
+          navigate('/dashboard', true);
+        } else if (isAdminRole(current.role) && isCitizenRoute(currentPath)) {
           navigate('/admin', true);
         }
       } finally {
@@ -150,12 +152,6 @@ export default function App() {
     };
 
     void init();
-
-    fetchHealth()
-      .then((h) => {
-        if (active) setAiMode(h.aiMode);
-      })
-      .catch(() => {});
 
     return () => {
       active = false;
@@ -167,19 +163,19 @@ export default function App() {
     const handlePopState = () => {
       const target = normalizePath(window.location.pathname);
       if (!user) {
-        if (target === '/citizen' || target === '/admin') {
-          navigate('/', true);
+        if (isCitizenRoute(target) || target === '/admin') {
+          navigate('/auth', true);
           return;
         }
         setRoute(target);
         return;
       }
 
-      if (user.role === 'CITIZEN' && target === '/admin') {
-        navigate('/citizen', true);
+      if (!isAdminRole(user.role) && target === '/admin') {
+        navigate('/dashboard', true);
         return;
       }
-      if (user.role === 'ADMIN' && target === '/citizen') {
+      if (isAdminRole(user.role) && isCitizenRoute(target)) {
         navigate('/admin', true);
         return;
       }
@@ -197,7 +193,7 @@ export default function App() {
       setComplaints([]);
       setOfflineDrafts([]);
       setLoginBanner(t('common.sessionExpired'));
-      navigate('/', true);
+      navigate('/auth', true);
     });
   }, [navigate, t]);
 
@@ -239,7 +235,7 @@ export default function App() {
         setUser(authedUser);
       }
 
-      navigate(authedUser.role === 'ADMIN' ? '/admin' : '/citizen', true);
+      navigate(isAdminRole(authedUser.role) ? '/admin' : '/dashboard', true);
     },
     [i18n, navigate]
   );
@@ -255,17 +251,17 @@ export default function App() {
 
   if (authChecking) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-6">
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center px-6">
         <div className="text-center space-y-2">
-          <div className="font-display text-lg font-bold text-slate-900">{t('common.appName')}</div>
-          <div className="text-xs text-slate-500">{t('common.verifyingSession')}</div>
+          <div className="font-display text-lg font-bold text-white">{t('common.appName')}</div>
+          <div className="text-xs text-slate-400">{t('common.verifyingSession')}</div>
         </div>
       </div>
     );
   }
 
-  // Protected console views when authenticated and on console route
-  if (user && user.role === 'CITIZEN' && route === '/citizen') {
+  // Protected Citizen Dashboard (/dashboard & legacy /citizen)
+  if (user && !isAdminRole(user.role) && isCitizenRoute(route)) {
     return (
       <div className="min-h-screen bg-slate-50 text-slate-900">
         <OfflineBanner
@@ -289,7 +285,8 @@ export default function App() {
     );
   }
 
-  if (user && user.role === 'ADMIN' && route === '/admin') {
+  // Protected Government Administration Console (/admin)
+  if (user && isAdminRole(user.role) && route === '/admin') {
     return (
       <div className="min-h-screen bg-slate-50 text-slate-900">
         <OfflineBanner
@@ -309,71 +306,49 @@ export default function App() {
     );
   }
 
-  // Public Authentication & Recovery Routes
-  if (route === '/login/citizen') {
+  // Unified Split-Screen Authentication Portal (/auth + legacy auth routes)
+  if (
+    route === '/auth' ||
+    route === '/login/citizen' ||
+    route === '/register/citizen' ||
+    route === '/login/admin' ||
+    route === '/forgot-password'
+  ) {
+    let initialTab: AuthPortalTab = 'citizen';
+    let initialCitizenMode: 'signin' | 'register' = 'signin';
+
+    if (route === '/register/citizen') {
+      initialTab = 'citizen';
+      initialCitizenMode = 'register';
+    } else if (route === '/login/admin') {
+      initialTab = 'official_signin';
+    } else if (route === '/forgot-password') {
+      initialTab = 'forgot';
+    }
+
     return (
-      <CitizenLoginForm
+      <UnifiedAuthPortal
+        key={route}
+        initialTab={initialTab}
+        initialCitizenMode={initialCitizenMode}
+        bannerMessage={loginBanner}
         onNavigate={(next) => {
           setLoginBanner(null);
           navigate(next);
         }}
         onAuthenticated={handleAuthenticated}
-        bannerMessage={loginBanner}
       />
     );
   }
 
-  if (route === '/register/citizen') {
-    return (
-      <CitizenRegisterForm
-        onNavigate={(next) => {
-          setLoginBanner(null);
-          navigate(next);
-        }}
-        onRegisteredSuccess={(msg) => {
-          setLoginBanner(msg);
-          navigate('/login/citizen', true);
-        }}
-      />
-    );
-  }
-
-  if (route === '/login/admin') {
-    return (
-      <AdminLoginForm
-        onNavigate={(next) => {
-          setLoginBanner(null);
-          navigate(next);
-        }}
-        onAuthenticated={handleAuthenticated}
-        bannerMessage={loginBanner}
-      />
-    );
-  }
-
-  if (route === '/forgot-password') {
-    return (
-      <ForgotPasswordFlow
-        onNavigate={(next) => {
-          setLoginBanner(null);
-          navigate(next);
-        }}
-        onResetComplete={(msg, targetLogin) => {
-          setLoginBanner(msg);
-          navigate(targetLogin, true);
-        }}
-      />
-    );
-  }
-
-  // Default Landing Screen (Zero auto-redirect into Citizen or Admin consoles)
+  // Default Public Civic Command Landing Page (/)
   return (
-    <AuthLandingPage
+    <PublicLandingPage
+      currentUser={user}
       onNavigate={(next) => {
         setLoginBanner(null);
         navigate(next);
       }}
-      aiMode={aiMode}
     />
   );
 }

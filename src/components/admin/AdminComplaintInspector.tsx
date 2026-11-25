@@ -3,7 +3,9 @@ import {
   AlertOctagon,
   Building2,
   CheckCircle2,
+  Clock,
   Copy,
+  FileText,
   Languages,
   MapPin,
   Save,
@@ -11,6 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { evaluateComplaintSla } from '../../../shared/sla.ts';
 import { fetchComplaintDetail, updateComplaintAdmin } from '../../lib/api.ts';
 import {
   formatLocaleDateTime,
@@ -46,6 +49,7 @@ export const AdminComplaintInspector: React.FC<AdminComplaintInspectorProps> = (
   const [error, setError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState<string | null>(null);
   const [textViewMode, setTextViewMode] = useState<'original' | 'english'>('original');
+  const [showEscalationDoc, setShowEscalationDoc] = useState(false);
 
   const [status, setStatus] = useState<ComplaintStatus>('Submitted');
   const [department, setDepartment] = useState<string>(MUNICIPAL_DEPARTMENTS[0]);
@@ -54,6 +58,7 @@ export const AdminComplaintInspector: React.FC<AdminComplaintInspectorProps> = (
 
   useEffect(() => {
     setTextViewMode('original');
+    setShowEscalationDoc(false);
   }, [complaintId]);
 
   useEffect(() => {
@@ -208,6 +213,74 @@ export const AdminComplaintInspector: React.FC<AdminComplaintInspectorProps> = (
                   </div>
                 </div>
               )}
+
+              {/* SLA Deadline & Legal Escalation Alert */}
+              {(() => {
+                const sla = evaluateComplaintSla(detail);
+                const escalated = Boolean(
+                  detail.escalation_notice_generated || detail.escalation_notice_sent_at
+                );
+                return (
+                  <div className="space-y-3">
+                    {escalated && (
+                      <div className="rounded-xl border border-rose-300 bg-rose-50 p-4 text-xs text-rose-950 space-y-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="inline-flex items-center gap-1.5 font-bold text-rose-900">
+                            <span>⚠️ Legal / SLA Escalation Issued</span>
+                          </div>
+                          {detail.escalation_document && (
+                            <button
+                              type="button"
+                              onClick={() => setShowEscalationDoc((prev) => !prev)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-rose-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-rose-900 hover:bg-rose-100 cursor-pointer"
+                            >
+                              <FileText className="h-3.5 w-3.5" />
+                              <span>{showEscalationDoc ? 'Hide Notice' : 'View Formal Notice'}</span>
+                            </button>
+                          )}
+                        </div>
+                        <p className="text-rose-900">
+                          Citizen generated a formal statutory grievance / RTI escalation notice (
+                          {(detail.escalation_language || 'en').toUpperCase()})
+                          {detail.escalation_notice_sent_at
+                            ? ` and marked it sent on ${formatLocaleDateTime(detail.escalation_notice_sent_at, i18n.language)}.`
+                            : '.'}
+                        </p>
+                        {showEscalationDoc && detail.escalation_document && (
+                          <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap rounded-lg border border-rose-200 bg-white p-3 font-sans text-[11px] leading-relaxed text-slate-800">
+                            {detail.escalation_document}
+                          </pre>
+                        )}
+                      </div>
+                    )}
+
+                    <div
+                      className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-4 py-3 text-xs ${
+                        sla.isBreached
+                          ? 'border-rose-200 bg-rose-50/70 text-rose-950'
+                          : sla.state === 'approaching'
+                          ? 'border-amber-200 bg-amber-50/70 text-amber-950'
+                          : 'border-slate-200 bg-slate-50 text-slate-700'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <Clock className="h-4 w-4 shrink-0" />
+                        <span className="font-semibold">SLA Target ({sla.windowLabel}):</span>
+                        <span className="font-mono font-bold">
+                          {sla.isResolved
+                            ? 'Resolved'
+                            : sla.isBreached
+                            ? `Overdue by ${sla.formattedDelta}`
+                            : `${sla.formattedDelta} remaining`}
+                        </span>
+                      </div>
+                      <span className="font-mono text-[11px]">
+                        Deadline: {formatLocaleDateTime(sla.deadlineIso, i18n.language)}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* Detected Language + Original vs. English Translation Toggle */}
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs">

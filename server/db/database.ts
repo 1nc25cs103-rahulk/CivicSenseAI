@@ -24,13 +24,101 @@ if (!fs.existsSync(uploadsDir)) {
 
 let dbInstance: Database.Database | null = null;
 
+function isCorruptionError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as { code?: string }).code ?? '';
+  const msg = err.message.toLowerCase();
+  return (
+    code === 'SQLITE_CORRUPT' ||
+    code === 'SQLITE_NOTADB' ||
+    code === 'SQLITE_IOERR' ||
+    msg.includes('database disk image is malformed') ||
+    msg.includes('file is not a database')
+  );
+}
+
+function removeSidecarFiles(dbPath: string): boolean {
+  let removed = false;
+  for (const suffix of ['-wal', '-shm', '-journal']) {
+    const sidecar = `${dbPath}${suffix}`;
+    if (fs.existsSync(sidecar)) {
+      fs.rmSync(sidecar, { force: true });
+      removed = true;
+    }
+  }
+  return removed;
+}
+
+function openAndValidateDatabase(dbPath: string): Database.Database {
+  const db = new Database(dbPath);
+  try {
+    // Use DELETE journal mode to avoid stale/corrupted WAL sidecar files across container snapshots.
+    db.pragma('journal_mode = DELETE');
+    db.pragma('foreign_keys = ON');
+    const check = db.pragma('quick_check', { simple: true });
+    if (check !== 'ok') {
+      throw new Error(`SQLite integrity check failed: ${String(check)}`);
+    }
+    return db;
+  } catch (err) {
+    try {
+      db.close();
+    } catch {
+      // Ignore close error on malformed handle
+    }
+    throw err;
+  }
+}
+
+export function openDatabaseWithRecovery(dbPath: string): Database.Database {
+  const dir = path.dirname(dbPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  try {
+    const db = openAndValidateDatabase(dbPath);
+    initializeSchema(db);
+    return db;
+  } catch (err) {
+    if (!isCorruptionError(err) && !(err instanceof Error && err.message.includes('integrity check failed'))) {
+      throw err;
+    }
+
+    // Step 1: If WAL/SHM sidecar files exist, discard them and try recovering the main DB file intact.
+    if (removeSidecarFiles(dbPath)) {
+      console.warn(`[CivicSense DB] Removed corrupted SQLite sidecar files for ${dbPath}; retrying open.`);
+      try {
+        const recovered = openAndValidateDatabase(dbPath);
+        initializeSchema(recovered);
+        return recovered;
+      } catch {
+        // Fall through to full recreation if the main DB file itself is damaged.
+      }
+    }
+
+    // Step 2: Back up the unreadable database file and create a clean database.
+    if (fs.existsSync(dbPath)) {
+      const backupPath = `${dbPath}.corrupt.${Date.now()}`;
+      try {
+        fs.renameSync(dbPath, backupPath);
+        console.warn(`[CivicSense DB] Backed up corrupted database to ${backupPath} and recreating fresh database.`);
+      } catch {
+        fs.rmSync(dbPath, { force: true });
+      }
+    }
+    removeSidecarFiles(dbPath);
+
+    const fresh = openAndValidateDatabase(dbPath);
+    initializeSchema(fresh);
+    return fresh;
+  }
+}
+
 export function getDb(): Database.Database {
   if (!dbInstance) {
     const dbPath = resolveDbPath();
-    dbInstance = new Database(dbPath);
-    dbInstance.pragma('journal_mode = WAL');
-    dbInstance.pragma('foreign_keys = ON');
-    initializeSchema(dbInstance);
+    dbInstance = openDatabaseWithRecovery(dbPath);
   }
   return dbInstance;
 }
@@ -43,7 +131,11 @@ export function initializeSchema(db: Database.Database): void {
       email TEXT NOT NULL UNIQUE,
       mobile TEXT NOT NULL DEFAULT '',
       password_hash TEXT NOT NULL DEFAULT '',
-      role TEXT NOT NULL CHECK(role IN ('CITIZEN', 'ADMIN')),
+      role TEXT NOT NULL CHECK(role IN ('citizen', 'admin', 'super_admin')),
+      department TEXT,
+      employee_id TEXT,
+      designation TEXT,
+      approved_by INTEGER REFERENCES Users(id),
       security_question TEXT NOT NULL DEFAULT '',
       security_answer_hash TEXT NOT NULL DEFAULT '',
       account_status TEXT NOT NULL DEFAULT 'active' CHECK(account_status IN ('active', 'pending', 'suspended')),
@@ -84,6 +176,13 @@ export function initializeSchema(db: Database.Database): void {
       english_location TEXT,
       status TEXT NOT NULL DEFAULT 'Submitted' CHECK(status IN ('Submitted', 'Under Review', 'Assigned', 'In Progress', 'Resolved', 'Rejected')),
       is_demo INTEGER NOT NULL DEFAULT 0,
+      sla_deadline TEXT,
+      escalation_notice_generated INTEGER NOT NULL DEFAULT 0,
+      escalation_notice_sent_at TEXT,
+      escalation_language TEXT,
+      escalation_document TEXT,
+      escalation_generation_method TEXT,
+      sla_breach_simulated INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES Users(id)

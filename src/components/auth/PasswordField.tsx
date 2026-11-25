@@ -11,6 +11,7 @@ interface PasswordFieldProps {
   autoComplete?: string;
   required?: boolean;
   showStrengthRules?: boolean;
+  showStrengthChecklist?: boolean;
   accent?: 'teal' | 'navy';
 }
 
@@ -42,11 +43,13 @@ export const PasswordField: React.FC<PasswordFieldProps> = ({
   autoComplete = 'current-password',
   required = true,
   showStrengthRules = false,
+  showStrengthChecklist = false,
   accent = 'teal',
 }) => {
   const { t } = useTranslation();
   const [visible, setVisible] = useState(false);
-  const checks = showStrengthRules ? getPasswordChecks(value) : [];
+  const showRules = showStrengthRules || showStrengthChecklist;
+  const checks = showRules ? getPasswordChecks(value) : [];
   const metCount = checks.filter((c) => c.met).length;
 
   const focusClass =
@@ -84,7 +87,7 @@ export const PasswordField: React.FC<PasswordFieldProps> = ({
         </button>
       </div>
 
-      {showStrengthRules && (
+      {showRules && (
         <div className="mt-2.5 space-y-2">
           <div className="grid grid-cols-5 gap-1.5" aria-hidden="true">
             {[1, 2, 3, 4, 5].map((step) => (
